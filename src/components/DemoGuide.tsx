@@ -74,8 +74,8 @@ const STEPS: DemoStep[] = [
   },
   {
     phase: P2, persona: 'u_dana',
-    title: 'The same thing, manually — Admin Console',
-    body: 'Same capability, form-based: click the **Assignments** tab, search or select Northwind (TKT-1031), and set lead attorney / additional attorneys / watchers from dropdowns. Useful when you want to review before committing, not just fire a one-line command.',
+    title: 'The same thing, manually — the Console',
+    body: 'Same capability, form-based: this is **Console**, Dana’s dedicated nav-rail item (only she sees it) — search or select Northwind (TKT-1031), and set lead attorney / additional attorneys / watchers from dropdowns. Useful when you want to review before committing, not just fire a one-line command.',
     run: () => { useStore.getState().setView('admin') },
   },
 
@@ -107,7 +107,7 @@ const STEPS: DemoStep[] = [
   {
     phase: P3, persona: 'u_kirsten',
     title: 'Add a comment, tag a colleague',
-    body: 'In the margin, add a new comment on any clause and **@-mention** someone — try tagging **Daniel Vohrer** (Privacy & Data) on the DPA-adjacent language. That posts as a real tagged sign-off request.',
+    body: 'Highlight any text in the document — a small toolbar appears. Click **Add comment**, write a note, and **@-mention** someone (try **Daniel Vohrer**, Privacy & Data). That posts as a real tagged sign-off request, anchored to that exact clause.',
     run: () => { const s = useStore.getState(); s.openAgreement('AGR-2180', 'review'); s.navigate({ reviewMode: 'directive' }) },
   },
   {

@@ -1,12 +1,13 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { clsx } from 'clsx'
-import { Bold, Italic, Underline, List, Table, Pilcrow, Check, X, CornerUpLeft, Pencil, Plus, Sparkles, BookOpen, Users, Lock, MessageSquare, MessageSquareOff, Flag, MoreHorizontal } from 'lucide-react'
+import { Bold, Italic, Underline, List, Table, Pilcrow, Check, X, CornerUpLeft, Pencil, Plus, Sparkles, BookOpen, Users, Lock, MessageSquare, MessageSquareOff, MessageSquarePlus, Flag, MoreHorizontal } from 'lucide-react'
 import { useStore } from '@/store'
 import { sendToAgent } from '@/agent/engine'
 import { can } from '@/lib/access'
 import { Chip, Avatar } from '@/components/ui'
 import { CommentReplies } from '@/components/CommentReplies'
+import { MentionComposer } from '@/components/MentionComposer'
 import { riskMeta, dispositionMeta } from '@/lib/labels'
 import { userById } from '@/data/seed'
 import type { DocRun } from '@/data/documents'
@@ -64,7 +65,11 @@ export function DocumentViewer({ versionId, agreementId, focusClauseId, focusRef
   const devs = useStore((s) => s.deviations).filter((d) => d.agreement_id === agreementId)
   const roleCanEdit = useStore((s) => can(s.users.find((u) => u.id === s.currentUserId)!.role, 'disposition'))
   const canSuggest = useStore((s) => can(s.users.find((u) => u.id === s.currentUserId)!.role, 'playbook_suggest'))
+  const canComment = useStore((s) => can(s.users.find((u) => u.id === s.currentUserId)!.role, 'comment'))
   const currentUserId = useStore((s) => s.currentUserId)
+  const users = useStore((s) => s.users)
+  const postMessage = useStore((s) => s.postMessage)
+  const ticketId = useStore((s) => s.agreements.find((a) => a.id === agreementId)?.ticket_id)
   const messages = useStore((s) => s.messages)
   const editClauseText = useStore((s) => s.editClauseText)
   // R18 — real document lock (store-backed), not a banner.
@@ -85,7 +90,9 @@ export function DocumentViewer({ versionId, agreementId, focusClauseId, focusRef
     messages.filter((m) => m.agreement_id === agreementId).flatMap((m) => [m.author_id, ...(m.mentions ?? [])]),
   )).filter((id) => id !== currentUserId).slice(0, 3)
   const containerRef = useRef<HTMLDivElement>(null)
-  const [askBtn, setAskBtn] = useState<{ text: string; x: number; y: number } | null>(null)
+  const [askBtn, setAskBtn] = useState<{ text: string; x: number; y: number; clauseId?: string } | null>(null)
+  const [commentOpen, setCommentOpen] = useState(false)
+  const clauseRefFor = (clauseId?: string) => doc?.clauses.find((c) => c.id === clauseId)?.ref
 
   // ---- Word-style margin comments: BOTH the AI analysis and the team's comments live next to
   // the document, anchored to their clauses, with a filter (All / AI / Team). ----
@@ -198,7 +205,9 @@ export function DocumentViewer({ versionId, agreementId, focusClauseId, focusRef
       return
     }
     const rect = sel.getRangeAt(0).getBoundingClientRect()
-    setAskBtn({ text, x: rect.left + rect.width / 2, y: rect.top })
+    const anchorEl = sel.anchorNode instanceof Element ? sel.anchorNode : sel.anchorNode.parentElement
+    const clauseId = anchorEl?.closest<HTMLElement>('[id^="clause-"]')?.id.replace(/^clause-/, '')
+    setAskBtn({ text, x: rect.left + rect.width / 2, y: rect.top, clauseId })
   }
   const snippetOf = (t: string) => (t.length > 320 ? t.slice(0, 320) + '…' : t)
   const askAi = () => {
@@ -207,6 +216,7 @@ export function DocumentViewer({ versionId, agreementId, focusClauseId, focusRef
     setAskBtn(null)
     window.getSelection()?.removeAllRanges()
   }
+  const closeCommentPopup = () => { setCommentOpen(false); setAskBtn(null); window.getSelection()?.removeAllRanges() }
   const suggestToPlaybook = () => {
     if (!askBtn) return
     sendToAgent(`Suggest to add to playbook as a fallback: "${snippetOf(askBtn.text)}"`)
@@ -306,7 +316,7 @@ export function DocumentViewer({ versionId, agreementId, focusClauseId, focusRef
         )}
       </div>
       <div ref={containerRef} onMouseUp={onSelect} onScroll={() => setAskBtn(null)} className="flex-1 overflow-y-auto py-6">
-        {askBtn && createPortal(
+        {askBtn && !commentOpen && createPortal(
           <div
             style={{ position: 'fixed', left: askBtn.x, top: askBtn.y - 10, transform: 'translate(-50%, -100%)', zIndex: 60 }}
             onMouseDown={(e) => e.preventDefault()}
@@ -315,11 +325,43 @@ export function DocumentViewer({ versionId, agreementId, focusClauseId, focusRef
             <button onClick={askAi} className="flex items-center gap-1.5 rounded-md bg-ai-600 px-2.5 py-1.5 text-[12px] font-semibold text-white transition hover:bg-ai-700">
               <Sparkles size={13} /> Ask AI
             </button>
+            {canComment && (
+              <button onClick={() => setCommentOpen(true)} title="Add a comment on this text and tag someone" className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12px] font-semibold text-slate-200 transition hover:bg-white/10">
+                <MessageSquarePlus size={13} /> Add comment
+              </button>
+            )}
             {canSuggest && (
               <button onClick={suggestToPlaybook} title="Suggest this clause for the playbook" className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-[12px] font-semibold text-slate-200 transition hover:bg-white/10">
                 <BookOpen size={13} /> Suggest to playbook
               </button>
             )}
+          </div>,
+          document.body,
+        )}
+        {askBtn && commentOpen && createPortal(
+          <div
+            style={{ position: 'fixed', left: askBtn.x, top: askBtn.y - 10, transform: 'translate(-50%, -100%)', zIndex: 61, width: 340 }}
+            onMouseDown={(e) => e.preventDefault()}
+            className="rounded-xl border border-slate-200 bg-white p-2.5 shadow-pop"
+          >
+            <div className="mb-1.5 flex items-center justify-between">
+              <span className="text-[11px] font-bold uppercase tracking-wide text-slate-400">
+                {clauseRefFor(askBtn.clauseId) ? `Comment on ${clauseRefFor(askBtn.clauseId)}` : 'Add a comment'}
+              </span>
+              <button onClick={closeCommentPopup} className="text-slate-300 hover:text-slate-500"><X size={13} /></button>
+            </div>
+            <MentionComposer
+              people={users.filter((u) => u.id !== currentUserId)}
+              placeholder="Comment on this text… type @ to tag a colleague for sign-off"
+              onPost={({ body, mentions, provision_reference }) => {
+                if (!ticketId || !body.trim()) return
+                postMessage({
+                  thread_type: 'agreement_level', ticket_id: ticketId, agreement_id: agreementId,
+                  body, tag: 'question', mentions, provision_reference: provision_reference ?? clauseRefFor(askBtn.clauseId),
+                })
+                closeCommentPopup()
+              }}
+            />
           </div>,
           document.body,
         )}

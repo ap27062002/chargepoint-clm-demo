@@ -1,211 +1,9 @@
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import { clsx } from 'clsx'
-import { GitBranch, Timer, CheckSquare, Bell, Users, Plug, Check, Rocket, TrendingUp, Megaphone, GraduationCap, FolderTree, BookOpen, Inbox, UserCog } from 'lucide-react'
-import { Card, Chip, Avatar, SectionLabel, Button, SearchBox, SortHeader, toggleSort } from '@/components/ui'
+import { UserCog } from 'lucide-react'
+import { Card, Avatar, SectionLabel, Button, SearchBox } from '@/components/ui'
 import { useStore } from '@/store'
-import { ROUTING_LABEL, type RoutingStrategy } from '@/lib/routing'
-import type { AgreementType, Ticket, User } from '@/types'
-
-type UserSortKey = 'name' | 'role' | 'title'
-
-// Intake §3 — the three configurable intake channels, plus the decision Eric wants his
-// team to see explicitly: individual attorney inbox reading is DISABLED.
-function IntakeSettings() {
-  const setToast = useStore((s) => s.setToast)
-  const [channels, setChannels] = useState({ inbox: true, manual: true, agent: true })
-  const CH = [
-    { key: 'inbox' as const, name: 'Standing inbox — CLM@chargepoint.com', desc: 'Forward incoming counterparty versions to the standing address; the system auto-detects the deal + agreement (embedded ID first, content match as fallback) and files them.' },
-    { key: 'manual' as const, name: 'In-deal manual upload', desc: 'The "Upload New Version" button on the deal overview and agreement review — drag & drop with detection + validation questioning.' },
-    { key: 'agent' as const, name: 'Agent upload', desc: 'Drop a file into the agent chat ("New version of the Northwind agreement") — the agent asks which document it belongs to, then files it.' },
-  ]
-  return (
-    <div className="max-w-2xl space-y-3">
-      <div>
-        <h3 className="text-[14px] font-bold text-slate-800">Document intake channels</h3>
-        <p className="text-[12px] text-slate-500">How returning counterparty versions enter the system.</p>
-      </div>
-      {CH.map((c) => (
-        <div key={c.key} className="flex items-start gap-3 rounded-xl border border-slate-200 bg-white p-3.5">
-          <button onClick={() => { setChannels((p) => ({ ...p, [c.key]: !p[c.key] })); setToast(`${c.name.split(' — ')[0]} ${channels[c.key] ? 'disabled' : 'enabled'}.`) }}
-            className={clsx('mt-0.5 h-5 w-9 shrink-0 rounded-full p-0.5 transition', channels[c.key] ? 'bg-brand-500' : 'bg-slate-300')}>
-            <span className={clsx('block h-4 w-4 rounded-full bg-white transition', channels[c.key] && 'translate-x-4')} />
-          </button>
-          <div>
-            <div className="text-[13px] font-bold text-slate-700">{c.name}</div>
-            <div className="mt-0.5 text-[12px] leading-snug text-slate-500">{c.desc}</div>
-          </div>
-        </div>
-      ))}
-      <div className="rounded-xl border border-red-100 bg-red-50/40 px-3.5 py-2.5 text-[12.5px] text-red-800">
-        <b>Individual attorney inbox reading: disabled.</b> The system never reads personal mailboxes — versions arrive only through the channels above.
-      </div>
-    </div>
-  )
-}
-
-const TABS = [
-  { key: 'routing', label: 'Routing', icon: <GitBranch size={15} /> },
-  { key: 'sla', label: 'SLAs', icon: <Timer size={15} /> },
-  { key: 'approvals', label: 'Approvals', icon: <CheckSquare size={15} /> },
-  { key: 'notifications', label: 'Notifications', icon: <Bell size={15} /> },
-  { key: 'playbook_sources', label: 'Playbook sources', icon: <FolderTree size={15} /> },
-  { key: 'assignments', label: 'Assignments', icon: <UserCog size={15} /> },
-  { key: 'users', label: 'Users & RBAC', icon: <Users size={15} /> },
-  { key: 'intake', label: 'Intake', icon: <Inbox size={15} /> },
-  { key: 'adoption', label: 'Adoption', icon: <Rocket size={15} /> },
-  { key: 'integrations', label: 'Integrations', icon: <Plug size={15} /> },
-] as const
-
-type Tab = (typeof TABS)[number]['key']
-
-function Toggle({ on, label, sub }: { on: boolean; label: string; sub?: string }) {
-  const [v, setV] = useState(on)
-  return (
-    <div className="flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2.5">
-      <div><div className="text-[13px] font-semibold text-slate-700">{label}</div>{sub && <div className="text-[11.5px] text-slate-400">{sub}</div>}</div>
-      <button onClick={() => setV(!v)} className={clsx('relative h-5 w-9 rounded-full transition', v ? 'bg-brand-500' : 'bg-slate-300')}>
-        <span className={clsx('absolute top-0.5 h-4 w-4 rounded-full bg-white transition', v ? 'left-[18px]' : 'left-0.5')} />
-      </button>
-    </div>
-  )
-}
-
-const integrations = [
-  { name: 'Microsoft Entra ID', cat: 'Identity', status: 'connected' },
-  { name: 'DocuSign', cat: 'E-Signature', status: 'connected' },
-  { name: 'SharePoint / OneDrive', cat: 'Documents', status: 'connected' },
-  { name: 'Outlook', cat: 'Email', status: 'connected' },
-  { name: 'Microsoft Teams', cat: 'Notifications', status: 'connected' },
-  { name: 'Slack', cat: 'Notifications', status: 'available' },
-  { name: 'Salesforce', cat: 'CRM', status: 'pending' },
-  { name: 'Claude (Anthropic)', cat: 'LLM', status: 'connected' },
-  { name: 'Azure OpenAI', cat: 'LLM', status: 'available' },
-]
-
-function RoutingTab() {
-  const strategy = useStore((s) => s.routingStrategy)
-  const setStrategy = useStore((s) => s.setRoutingStrategy)
-  const subs: Record<RoutingStrategy, string> = {
-    expertise: 'Match by agreement-type expertise', workload: 'Assign to the attorney with the lowest open load',
-    hybrid: 'Expertise match, then lowest load among experts', round_robin: 'Rotate evenly across attorneys',
-    manual: 'Always require a manual choice',
-  }
-  return (
-    <div className="grid max-w-2xl gap-3">
-      <SectionLabel>Assignment routing strategy — active for new tickets</SectionLabel>
-      {(Object.keys(ROUTING_LABEL) as RoutingStrategy[]).map((r) => (
-        <button key={r} onClick={() => setStrategy(r)}
-          className={clsx('flex items-center justify-between rounded-lg border px-3 py-2.5 text-left transition', strategy === r ? 'border-brand-400 bg-brand-50' : 'border-slate-200 hover:bg-slate-50')}>
-          <div>
-            <div className={clsx('text-[13px] font-semibold', strategy === r ? 'text-brand-700' : 'text-slate-700')}>{ROUTING_LABEL[r]}</div>
-            <div className="text-[11.5px] text-slate-400">{subs[r]}</div>
-          </div>
-          <span className={clsx('flex h-4 w-4 items-center justify-center rounded-full border-2', strategy === r ? 'border-brand-500' : 'border-slate-300')}>
-            {strategy === r && <span className="h-2 w-2 rounded-full bg-brand-500" />}
-          </span>
-        </button>
-      ))}
-      <div className="mt-1 rounded-lg bg-slate-50 px-3 py-2 text-[12px] text-slate-500">
-        New agreements created via intake are routed using this strategy — try it: switch to <b>Workload balance</b>, then ask the agent to draft an NDA and watch who it's assigned to in the audit log.
-      </div>
-    </div>
-  )
-}
-
-function AdoptionTab() {
-  const setToast = useStore((s) => s.setToast)
-  const [nudged, setNudged] = useState(false)
-  const teams = [
-    { team: 'Legal — Commercial', pct: 92 },
-    { team: 'Legal — Privacy', pct: 78 },
-    { team: 'Strategic Partnerships (biz)', pct: 61 },
-    { team: 'Finance Business Partners', pct: 34 },
-  ]
-  const phases = [
-    { name: 'Pilot — Commercial Legal', state: 'done' as const },
-    { name: 'Rollout — full Legal team', state: 'active' as const },
-    { name: 'Business-user self-serve intake', state: 'active' as const },
-    { name: 'Org-wide (all deal teams)', state: 'todo' as const },
-  ]
-  return (
-    <div className="grid max-w-3xl gap-4">
-      <div className="grid grid-cols-3 gap-3">
-        {[['Active users (30d)', '38 / 54', '70%'], ['NDAs via self-serve', '61%', '+18pts QoQ'], ['Avg. cycle time', '4.2 days', '−41% vs baseline']].map(([label, value, sub]) => (
-          <Card key={label} className="p-3.5"><div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">{label}</div><div className="mt-1 text-[19px] font-bold text-slate-800">{value}</div><div className="text-[11.5px] font-semibold text-brand-600">{sub}</div></Card>
-        ))}
-      </div>
-
-      <Card className="p-4">
-        <div className="mb-2 flex items-center gap-1.5"><TrendingUp size={14} className="text-brand-600" /><SectionLabel>Adoption by team</SectionLabel></div>
-        <div className="space-y-2.5">
-          {teams.map((t) => (
-            <div key={t.team} className="flex items-center gap-3">
-              <span className="w-56 shrink-0 text-[12.5px] font-semibold text-slate-600">{t.team}</span>
-              <div className="h-2.5 flex-1 overflow-hidden rounded-full bg-slate-100"><div className={clsx('h-full rounded-full', t.pct >= 70 ? 'bg-brand-500' : t.pct >= 45 ? 'bg-amber-400' : 'bg-red-400')} style={{ width: `${t.pct}%` }} /></div>
-              <span className="w-9 shrink-0 text-right text-[12px] font-bold text-slate-700">{t.pct}%</span>
-              {t.pct < 45 && <Button size="sm" variant="outline" icon={<Megaphone size={12} />} onClick={() => { setNudged(true); setToast(`Enablement nudge sent to ${t.team}.`) }} disabled={nudged}>{nudged ? 'Nudged' : 'Nudge'}</Button>}
-            </div>
-          ))}
-        </div>
-      </Card>
-
-      <Card className="p-4">
-        <div className="mb-2.5 flex items-center gap-1.5"><Rocket size={14} className="text-brand-600" /><SectionLabel>Rollout plan</SectionLabel></div>
-        <div className="space-y-2">
-          {phases.map((p) => (
-            <div key={p.name} className="flex items-center gap-2.5">
-              <span className={clsx('flex h-5 w-5 items-center justify-center rounded-full text-[11px] font-bold', p.state === 'done' ? 'bg-brand-500 text-white' : p.state === 'active' ? 'bg-ai-600 text-white' : 'bg-slate-200 text-slate-400')}>{p.state === 'done' ? <Check size={12} /> : ''}</span>
-              <span className={clsx('text-[12.5px]', p.state === 'todo' ? 'text-slate-400' : 'font-semibold text-slate-700')}>{p.name}</span>
-              {p.state === 'active' && <Chip className="bg-ai-50 text-ai-700 ring-ai-500/20">In progress</Chip>}
-            </div>
-          ))}
-        </div>
-      </Card>
-
-      <Card className="flex items-center justify-between p-4">
-        <div className="flex items-center gap-2.5"><GraduationCap size={18} className="text-ai-600" /><div><div className="text-[13px] font-bold text-slate-700">Change management</div><div className="text-[11.5px] text-slate-400">Broadcast the in-app tour + office hours to teams under 70% adoption.</div></div></div>
-        <Button size="sm" variant="ai" icon={<Megaphone size={13} />} onClick={() => setToast('Announcement + guided tour scheduled for low-adoption teams.')}>Announce rollout</Button>
-      </Card>
-    </div>
-  )
-}
-
-// R49 — admin-configured default source folder + example set per agreement type (persisted).
-function PlaybookSourcesTab() {
-  const defaults = useStore((s) => s.playbookSourceDefaults)
-  const setDefault = useStore((s) => s.setPlaybookSourceDefault)
-  const agreements = useStore((s) => s.agreements)
-  const types = Object.keys(defaults) as AgreementType[]
-  return (
-    <div className="grid max-w-3xl gap-3">
-      <SectionLabel>Default playbook source folders — “create the playbook” uses these with no path argument</SectionLabel>
-      {types.map((type) => {
-        const folder = defaults[type]!
-        return (
-          <Card key={type} className="p-4">
-            <div className="mb-2 flex items-center gap-2"><BookOpen size={14} className="text-slate-400" /><span className="text-[13px] font-bold text-slate-700">{type}</span><Chip className="bg-slate-100 text-slate-500 ring-slate-300/30 font-mono">{folder.templateId}</Chip></div>
-            <label className="block text-[11px] font-semibold uppercase tracking-wide text-slate-400">Folder path</label>
-            <input defaultValue={folder.path} onBlur={(e) => e.target.value !== folder.path && setDefault(type, { ...folder, path: e.target.value })}
-              className="mt-1 w-full rounded-lg border border-slate-300 px-2.5 py-1.5 font-mono text-[12px] text-slate-700 outline-none focus:border-brand-400" />
-            <div className="mt-2 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Example agreements ({folder.exampleAgreementIds.length})</div>
-            <div className="mt-1 flex flex-wrap gap-1.5">
-              {agreements.filter((a) => a.agreement_type === type || a.agreement_type === 'MNDA' || a.agreement_type === 'NDA').map((a) => {
-                const on = folder.exampleAgreementIds.includes(a.id)
-                return (
-                  <button key={a.id} onClick={() => setDefault(type, { ...folder, exampleAgreementIds: on ? folder.exampleAgreementIds.filter((x) => x !== a.id) : [...folder.exampleAgreementIds, a.id] })}
-                    className={clsx('rounded-full px-2.5 py-0.5 text-[11px] font-semibold ring-1', on ? 'bg-brand-50 text-brand-700 ring-brand-200' : 'bg-white text-slate-400 ring-slate-200')}>
-                    {on && <Check size={9} className="mr-0.5 inline" />}{a.id}
-                  </button>
-                )
-              })}
-            </div>
-            <div className="mt-2 text-[11px] text-slate-400">Saved to your browser — reload and it persists. This is what “create the {type} playbook” derives from.</div>
-          </Card>
-        )
-      })}
-    </div>
-  )
-}
+import type { Ticket, User } from '@/types'
 
 // Admin-only: assign a ticket's lead + co-counsel attorneys, and add stakeholders (e.g. sales
 // reps) who get read visibility without an assignment. Same underlying action the chat-driven
@@ -270,7 +68,7 @@ function AssignmentsTab() {
   const selected = tickets.find((t) => t.id === selectedId) ?? null
 
   return (
-    <div className="grid max-w-4xl grid-cols-[280px_1fr] gap-4">
+    <div className={clsx('grid max-w-4xl grid-cols-[280px_1fr] gap-4')}>
       <div>
         <SearchBox value={q} onChange={setQ} placeholder="Search tickets…" className="mb-2 w-full" />
         <div className="max-h-[560px] space-y-1 overflow-y-auto">
@@ -291,122 +89,22 @@ function AssignmentsTab() {
   )
 }
 
+// Trimmed to Dana Whitfield's one real job in this build: routing tickets to a lead attorney
+// and giving other stakeholders (e.g. sales reps) read visibility. The other admin surfaces
+// (routing strategy, SLAs, approvals, notifications, playbook sources, users, intake,
+// adoption, integrations) aren't part of this narrative — cut rather than left half-built.
 export function AdminView() {
-  const [tab, setTab] = useState<Tab>('routing')
-  const users = useStore((s) => s.users)
-  const setToast = useStore((s) => s.setToast)
-  const [connected, setConnected] = useState<string[]>([])
-  const [userQ, setUserQ] = useState('')
-  const [userSort, setUserSort] = useState<{ key: UserSortKey; dir: 'asc' | 'desc' }>({ key: 'name', dir: 'asc' })
-  const userQl = userQ.toLowerCase().trim()
-  const sortedUsers = useMemo(() => users
-    .filter((u) => !userQl || u.name.toLowerCase().includes(userQl) || u.role.toLowerCase().includes(userQl) || u.title.toLowerCase().includes(userQl))
-    .sort((a, b) => {
-      const d = userSort.dir === 'asc' ? 1 : -1
-      if (userSort.key === 'role') return a.role.localeCompare(b.role) * d
-      if (userSort.key === 'title') return a.title.localeCompare(b.title) * d
-      return a.name.localeCompare(b.name) * d
-    }),
-    [users, userQl, userSort])
-  const onUserSort = (key: UserSortKey) => setUserSort((s) => toggleSort(key, s, () => true))
-
   return (
     <div className="flex h-full flex-col">
-      <div className="border-b border-slate-200 bg-white px-6 pt-4">
-        <h1 className="text-xl font-bold text-slate-800">Admin Console</h1>
-        <p className="text-[13px] text-slate-500">Configure routing, SLAs, approvals, notifications, users, and integrations.</p>
-        <div className="mt-3 flex gap-1 overflow-x-auto">
-          {TABS.map((t) => (
-            <button key={t.key} onClick={() => setTab(t.key)} className={clsx('flex items-center gap-1.5 whitespace-nowrap border-b-2 px-3 py-2 text-[13px] font-semibold transition', tab === t.key ? 'border-brand-500 text-brand-700' : 'border-transparent text-slate-400 hover:text-slate-600')}>
-              {t.icon}{t.label}
-            </button>
-          ))}
+      <div className="border-b border-slate-200 bg-white px-6 pt-4 pb-3">
+        <div className="flex items-center gap-2">
+          <UserCog size={18} className="text-slate-400" />
+          <h1 className="text-xl font-bold text-slate-800">Console — Ticket Assignments</h1>
         </div>
+        <p className="text-[13px] text-slate-500">Assign a lead attorney and give other stakeholders (sales reps, co-counsel) visibility on a ticket.</p>
       </div>
-
       <div className="flex-1 overflow-y-auto p-6">
-        {tab === 'routing' && <RoutingTab />}
-        {tab === 'intake' && <IntakeSettings />}
-        {tab === 'sla' && (
-          <div className="grid max-w-2xl gap-3">
-            <SectionLabel>SLA cycle-time targets (business days)</SectionLabel>
-            {[['NDA / MNDA', 7], ['MSA', 14], ['DPA', 10], ['SOW', 5]].map(([k, v]) => (
-              <div key={k as string} className="flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2.5">
-                <span className="text-[13px] font-semibold text-slate-700">{k}</span>
-                <span className="rounded-md bg-slate-100 px-3 py-1 text-[13px] font-bold text-slate-700">{v} days</span>
-              </div>
-            ))}
-            <Toggle on label="Escalate at 80% of SLA window" sub="Warning notification + manager escalation on breach" />
-          </div>
-        )}
-        {tab === 'approvals' && (
-          <div className="grid max-w-2xl gap-3">
-            <SectionLabel>Approval rules</SectionLabel>
-            <Toggle on label="Deal-value approval" sub="Deals > $1M require VP Legal sign-off" />
-            <Toggle on label="Agreement-type approval" sub="DPAs require Privacy counsel approval" />
-            <Toggle on label="Red-line approval" sub="Any accepted red-line deviation escalates to Playbook Owner" />
-            <div className="mt-2 flex gap-2">
-              <Chip className="bg-slate-100 text-slate-600 ring-slate-300/40">Sequential</Chip>
-              <Chip className="bg-brand-50 text-brand-700 ring-brand-500/20">Parallel (active)</Chip>
-            </div>
-          </div>
-        )}
-        {tab === 'notifications' && (
-          <div className="grid max-w-2xl gap-3">
-            <SectionLabel>Notification channels by event</SectionLabel>
-            {['Ticket created', 'Contributor tagged', 'Redline received', 'Approval request', 'SLA warning', 'Signature completed', 'AI analysis complete'].map((e) => (
-              <div key={e} className="flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2.5">
-                <span className="text-[13px] font-semibold text-slate-700">{e}</span>
-                <div className="flex gap-1.5">
-                  {['In-app', 'Email', 'Teams', 'Slack'].map((c, i) => (
-                    <Chip key={c} className={i < 2 || e.includes('SLA') ? 'bg-brand-50 text-brand-700 ring-brand-500/20' : 'bg-slate-100 text-slate-400 ring-slate-300/30'}>{c}</Chip>
-                  ))}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-        {tab === 'playbook_sources' && <PlaybookSourcesTab />}
-        {tab === 'assignments' && <AssignmentsTab />}
-        {tab === 'adoption' && <AdoptionTab />}
-        {tab === 'users' && (
-          <div className="max-w-3xl">
-            <div className="mb-2 flex justify-end"><SearchBox value={userQ} onChange={setUserQ} placeholder="Search name, role, title…" className="w-64" /></div>
-            <Card className="overflow-hidden">
-              <table className="w-full text-left text-[13px]">
-                <thead><tr className="border-b border-slate-100 text-[11px] uppercase tracking-wide text-slate-400">
-                  <SortHeader sortKey="name" active={userSort.key === 'name'} dir={userSort.dir} onSort={onUserSort} className="px-4">User</SortHeader>
-                  <SortHeader sortKey="role" active={userSort.key === 'role'} dir={userSort.dir} onSort={onUserSort}>Role (Entra-synced)</SortHeader>
-                  <SortHeader sortKey="title" active={userSort.key === 'title'} dir={userSort.dir} onSort={onUserSort}>Title</SortHeader>
-                </tr></thead>
-                <tbody>
-                  {sortedUsers.length === 0 && <tr><td colSpan={3} className="px-4 py-6 text-center text-[12.5px] text-slate-400">No users match.</td></tr>}
-                  {sortedUsers.map((u) => (
-                    <tr key={u.id} className="border-b border-slate-50">
-                      <td className="px-4 py-2.5"><div className="flex items-center gap-2"><Avatar userId={u.id} size={24} /><span className="font-semibold text-slate-700">{u.name}</span></div></td>
-                      <td className="px-2 py-2.5"><Chip className="bg-indigo-50 text-indigo-600 ring-indigo-500/20 capitalize">{u.role.replace('_', ' ')}</Chip></td>
-                      <td className="px-2 py-2.5 text-slate-500">{u.title}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </Card>
-          </div>
-        )}
-        {tab === 'integrations' && (
-          <div className="grid max-w-3xl grid-cols-2 gap-3">
-            {integrations.map((it) => (
-              <Card key={it.name} className="flex items-center justify-between p-3.5">
-                <div><div className="text-[13px] font-bold text-slate-700">{it.name}</div><div className="text-[11.5px] text-slate-400">{it.cat}</div></div>
-                {it.status === 'connected' || connected.includes(it.name)
-                  ? <Chip className="bg-brand-50 text-brand-700 ring-brand-500/20"><Check size={11} /> Connected</Chip>
-                  : it.status === 'pending'
-                    ? <Chip className="bg-amber-50 text-amber-700 ring-amber-500/20">Pending</Chip>
-                    : <Button size="sm" variant="outline" onClick={() => { setConnected((c) => [...c, it.name]); setToast(`${it.name} connected.`) }}>Connect</Button>}
-              </Card>
-            ))}
-          </div>
-        )}
+        <AssignmentsTab />
       </div>
     </div>
   )

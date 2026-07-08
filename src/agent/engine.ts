@@ -864,10 +864,10 @@ const intents: Intent[] = [
   },
   {
     name: 'admin', cap: 'admin',
-    test: (t) => has(t, 'admin', 'configure', 'routing', 'integration', 'sla config', 'manage user'),
+    test: (t) => has(t, 'admin', 'console', 'assign', 'manage user'),
     reply: () => ({
-      text: `The **Admin Console** is ready — open it below. From here you configure assignment **routing**, **SLA** targets, **approval** chains, **notification** channels, **users & RBAC**, and **integrations** (Entra, DocuSign, SharePoint, Salesforce, LLMs). Changes are audited.`,
-      artifact: { kind: 'admin', title: 'Admin console' },
+      text: `The **Console** is ready — open it below. From here you assign a ticket's **lead attorney**, add **co-counsel**, and give other stakeholders (e.g. sales reps) **read visibility** without an assignment.`,
+      artifact: { kind: 'admin', title: 'Console' },
       actions: [{ label: 'Review the audit log', prompt: 'show me the audit log', variant: 'primary' }],
     }),
   },

@@ -1,10 +1,10 @@
 import { clsx } from 'clsx'
-import { Sparkles, LayoutDashboard, BookOpen, FolderTree, Lock, FileStack } from 'lucide-react'
+import { Sparkles, LayoutDashboard, BookOpen, FolderTree, Lock, FileStack, UserCog } from 'lucide-react'
 import { useStore } from '@/store'
 import { can } from '@/lib/access'
 import type { Role } from '@/types'
 
-type RailKey = 'agent' | 'dashboard' | 'repository' | 'playbook' | 'projects'
+type RailKey = 'agent' | 'dashboard' | 'repository' | 'playbook' | 'projects' | 'console'
 type RailItem = {
   key: RailKey
   label: string
@@ -13,12 +13,15 @@ type RailItem = {
   show?: (role: Role) => boolean
 }
 
+// 'console' maps to the 'admin' canvas view — named "Console" in the nav (not "Admin") since it's
+// scoped to one job here: ticket assignment. Only administrators (Dana) hold the 'admin' capability.
 const ITEMS: RailItem[] = [
   { key: 'agent', label: 'Agent', icon: <Sparkles size={18} /> },
   { key: 'dashboard', label: 'Dashboard', icon: <LayoutDashboard size={18} />, show: (r) => can(r, 'pipeline') },
   { key: 'repository', label: 'Archive', icon: <FolderTree size={18} />, locked: true, show: (r) => can(r, 'review') || can(r, 'pipeline') },
   { key: 'playbook', label: 'Playbook', icon: <BookOpen size={18} />, show: (r) => can(r, 'playbook_view') },
   { key: 'projects', label: 'Templates', icon: <FileStack size={18} />, show: (r) => can(r, 'templates') },
+  { key: 'console', label: 'Console', icon: <UserCog size={18} />, show: (r) => can(r, 'admin') },
 ]
 
 export function LeftRail() {
@@ -30,20 +33,23 @@ export function LeftRail() {
   const role = useStore((s) => s.users.find((u) => u.id === s.currentUserId)!.role)
   // Tomas, Priya, Dana, Marcus (contributor/administrator/initiator) are light-touch users —
   // they work entirely through the agent chat + their dashboard, not the full workspace nav.
+  // Dana (administrator) is the one exception: she also gets Console, her one real UI surface.
   const RESTRICTED: Role[] = ['contributor', 'administrator', 'initiator']
-  const visible = ITEMS.filter((i) => (RESTRICTED.includes(role) ? i.key === 'agent' || i.key === 'dashboard' : !i.show || i.show(role)))
+  const visible = ITEMS.filter((i) => (RESTRICTED.includes(role)
+    ? i.key === 'agent' || i.key === 'dashboard' || (i.key === 'console' && role === 'administrator')
+    : !i.show || i.show(role)))
 
   const go = (k: RailKey) => {
     if (k === 'agent') closeCanvas()
     else {
-      openFull(k) // full-width section; the agent collapses and is one click away
+      openFull(k === 'console' ? 'admin' : k) // full-width section; the agent collapses and is one click away
       // Nav lands on the all-playbooks LIBRARY (agent deep-links still open a specific playbook).
       if (k === 'playbook') navigate({ playbookMode: 'library', playbookId: undefined, playbookDraftId: undefined })
     }
   }
 
   const isActive = (k: RailKey) =>
-    k === 'agent' ? !open : open && view === k
+    k === 'agent' ? !open : k === 'console' ? open && view === 'admin' : open && view === k
 
   return (
     <nav className="flex w-[68px] shrink-0 flex-col items-center gap-1.5 border-r border-slate-200 bg-white py-3">

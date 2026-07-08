@@ -10,7 +10,7 @@ export type Capability =
   | 'intake'         // create tickets / draft new agreements
   | 'playbook_view'  // view playbooks
   | 'playbook_edit'  // create/approve playbook changes + refinement
-  | 'admin'          // admin console (routing/SLA/approvals/users/integrations)
+  | 'admin'          // the Console — ticket assignment (lead attorney + stakeholder visibility)
   | 'audit'          // audit center
   | 'deal_summary'   // executed deal summaries / analytics
   | 'comment'        // comment on provisions
@@ -65,7 +65,7 @@ export const CAP_LABEL: Record<Capability, string> = {
   queue: 'your queue', notifications: 'notifications', pipeline: 'the full contract pipeline',
   review: 'agreement review', disposition: 'deciding deviations or sending documents',
   intake: 'creating new agreements', playbook_view: 'the playbook', playbook_edit: 'editing playbooks',
-  admin: 'the admin console', audit: 'the audit center', deal_summary: 'deal summaries & analytics',
+  admin: 'the console', audit: 'the audit center', deal_summary: 'deal summaries & analytics',
   comment: 'commenting',
   playbook_suggest: 'suggesting playbook additions', templates: 'the Templates workspace',
   playbook_presentation: 'the playbook look & feel (admin only)',
@@ -77,7 +77,7 @@ export const ROLE_SCOPE: Record<Role, string> = {
   attorney: 'review and negotiate your assigned agreements, set dispositions, and approve external delivery',
   contributor: 'view documents you’re tagged on (read-only) and comment on provisions',
   playbook_owner: 'manage playbooks, approve refinement recommendations, and review analytics',
-  administrator: 'configure routing, SLAs, approvals, users and integrations, and review the audit log',
+  administrator: 'assign tickets to attorneys, give other stakeholders visibility, and review the audit log',
 }
 
 export interface Starter { label: string; sub: string; prompt: string }
@@ -106,7 +106,7 @@ export function startersFor(role: Role): Starter[] {
       ]
     case 'administrator':
       return [
-        { label: 'Open the admin console', sub: 'Routing · SLAs · integrations', prompt: 'open the admin console' },
+        { label: 'Open the console', sub: 'Assign tickets, add stakeholders', prompt: 'open the console' },
         { label: 'Review playbook suggestions', sub: 'Attorney-proposed additions', prompt: 'review playbook suggestions' },
         { label: 'Templates', sub: 'Baseline form agreements', prompt: 'open templates' },
         { label: 'Review the audit log', sub: 'Immutable event history', prompt: 'show me the audit log' },
