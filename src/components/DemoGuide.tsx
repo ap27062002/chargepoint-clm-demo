@@ -41,6 +41,22 @@ const STEPS: DemoStep[] = [
     run: () => { const s = useStore.getState(); s.setPersona('u_marcus'); s.closeCanvas(); sendToAgent('create a ticket') },
   },
   {
+    phase: P1, persona: 'u_marcus',
+    title: 'The wizard, completed — a fresh NDA request',
+    body: 'Whatever you clicked through above, here’s the guaranteed outcome so the story stays on track: a brand-new NDA request for a prospect, **Redwood Fleet Services**, sourced from the Standard NDA template — created, then routed to Kirsten. A real agreement in Draft status, not a placeholder — Act 3 picks this up.',
+    run: () => {
+      const s = useStore.getState()
+      const existing = s.tickets.find((t) => t.counterparty_name === 'Redwood Fleet Services')
+      if (existing) { s.openTicket(existing.id); return }
+      s.startNegotiationWizard()
+      s.setWizardScope('single')
+      s.setWizardSource({ sourceMode: 'template', templateIds: ['TPL-9001'] })
+      s.setWizardCounterparty('Redwood Fleet Services')
+      const { ticketId } = s.confirmNegotiationWizard()
+      if (ticketId) s.assignTicketTeam(ticketId, { leadAttorneyId: 'u_kirsten' })
+    },
+  },
+  {
     phase: P1, persona: 'u_marcus', agentic: true,
     title: 'Track my requests — by chat',
     body: 'An initiator’s other core move: checking status without opening anything. This is the same "what\'s on my plate" the agent gives everyone, scoped down to Marcus\'s own tickets.',
@@ -83,8 +99,40 @@ const STEPS: DemoStep[] = [
   {
     phase: P3, persona: 'u_kirsten',
     title: 'It lands in the attorney’s queue',
-    body: 'Switching seats to **Kirsten Sachs**, Senior Counsel — the assigned attorney. Northwind is in her **My Open Tickets** queue, with SLA aging visible at a glance.',
+    body: 'Switching seats to **Kirsten Sachs**, Senior Counsel — the assigned attorney. Northwind is in her **My Open Tickets** queue with SLA aging visible — and right alongside it, the **Redwood Fleet Services** NDA Marcus just kicked off in Act 1, sitting in **Draft**.',
     run: () => { const s = useStore.getState(); s.setPersona('u_kirsten'); s.setView('dashboard') },
+  },
+  {
+    phase: P3, persona: 'u_kirsten',
+    title: 'A fresh draft, not a redline — Redwood Fleet Services',
+    body: 'Different starting point from Northwind entirely: no counterparty has sent anything back yet — this is ChargePoint’s own paper, drafted from the Standard NDA template, waiting for Kirsten to develop it.',
+    run: () => {
+      const s = useStore.getState()
+      const t = s.tickets.find((tk) => tk.counterparty_name === 'Redwood Fleet Services')
+      if (t) s.openTicket(t.id)
+    },
+  },
+  {
+    phase: P3, persona: 'u_kirsten',
+    title: 'Start drafting — real content, not a placeholder',
+    body: 'Since this agreement is in **Draft** status, **Ask Claude**’s only starter is **Start drafting**. Click it, fill in purpose / term / jurisdiction, and watch it write directly into the real Term & Termination and Governing Law clauses — not just metadata.',
+    run: () => {
+      const s = useStore.getState()
+      const t = s.tickets.find((tk) => tk.counterparty_name === 'Redwood Fleet Services')
+      const ag = t ? s.agreements.find((a) => a.ticket_id === t.id) : undefined
+      if (ag) s.openAgreement(ag.id, 'review')
+    },
+  },
+  {
+    phase: P3, persona: 'u_kirsten',
+    title: 'Edit the draft by chat',
+    body: 'With a draft open, free text in **Ask Claude** doesn’t just answer — it edits the live document for real. Try typing "change the governing law to Delaware" or "make the term 3 years" and watch the clause update.',
+    run: () => {
+      const s = useStore.getState()
+      const t = s.tickets.find((tk) => tk.counterparty_name === 'Redwood Fleet Services')
+      const ag = t ? s.agreements.find((a) => a.ticket_id === t.id) : undefined
+      if (ag) s.openAgreement(ag.id, 'review')
+    },
   },
   {
     phase: P3, persona: 'u_kirsten',
@@ -117,10 +165,10 @@ const STEPS: DemoStep[] = [
     run: () => { const s = useStore.getState(); s.openAgreement('AGR-2180', 'review'); s.navigate({ reviewMode: 'directive', reviewFocusRef: '§12' }) },
   },
   {
-    phase: P3, persona: 'u_kirsten', agentic: true,
-    title: 'Suggest a fix to the playbook — by chat',
-    body: 'Attorneys can **propose** playbook changes, but not publish them — that’s Eric’s call, coming up in Act 3. Watch the agent route this to his approval queue instead of just applying it.',
-    run: () => { const s = useStore.getState(); s.closeCanvas(); sendToAgent('suggest this to the playbook as a fallback') },
+    phase: P3, persona: 'u_kirsten',
+    title: 'Suggest a fix to the playbook — from Ask Claude',
+    body: 'This one lives in the document, not the main agent chat: highlight the §12 liability text, click **Ask AI** on the selection, then in the **Ask Claude** panel on the right, click **Suggest this clause to the playbook**. Attorneys can propose playbook changes but not publish them — that’s Eric’s call, coming up in Act 4. Watch it route to his approval queue instead of applying anything.',
+    run: () => { useStore.getState().openAgreement('AGR-2180', 'review') },
   },
   {
     phase: P3, persona: 'u_kirsten', agentic: true,
@@ -173,7 +221,7 @@ const STEPS: DemoStep[] = [
   {
     phase: P3, persona: 'u_kirsten', agentic: true,
     title: 'Proceed to execution & signing — by chat',
-    body: 'Closing Act 2 the same way it opened — one prompt.',
+    body: 'Closing Act 3 the same way it opened — one prompt.',
     run: () => { const s = useStore.getState(); s.closeCanvas(); sendToAgent('execute the northwind deal') },
   },
   {
@@ -187,13 +235,13 @@ const STEPS: DemoStep[] = [
   {
     phase: P4, persona: 'u_eric',
     title: 'Switching to the Playbook Owner',
-    body: '**Eric Batill**, Associate General Counsel — the only role that can actually publish playbook changes. Everything Kirsten proposed in Act 2 routes here.',
+    body: '**Eric Batill**, Associate General Counsel — the only role that can actually publish playbook changes. Everything Kirsten proposed in Act 3 routes here.',
     run: () => { const s = useStore.getState(); s.setPersona('u_eric'); s.setView('dashboard') },
   },
   {
     phase: P4, persona: 'u_eric', agentic: true,
     title: 'Create a playbook — by chat',
-    body: 'The same prompt Kirsten couldn’t use in Act 2 — because attorneys don’t hold the playbook_edit capability. From Eric’s seat, it works: point it at a template + example agreements, and it derives starting positions from how those examples actually resolved each section.',
+    body: 'The same prompt Kirsten couldn’t use in Act 3 — because attorneys don’t hold the playbook_edit capability. From Eric’s seat, it works: point it at a template + example agreements, and it derives starting positions from how those examples actually resolved each section.',
     run: () => { const s = useStore.getState(); s.closeCanvas(); sendToAgent('create a playbook for our MSA') },
   },
   {
@@ -217,7 +265,7 @@ const STEPS: DemoStep[] = [
   {
     phase: P4, persona: 'u_eric',
     title: 'Approve Kirsten’s suggestion — human decides',
-    body: 'This is what Kirsten proposed back in Act 2. **Approve** publishes it to the live playbook, **Reject** discards it, **Defer** holds it — Eric’s call alone.',
+    body: 'This is what Kirsten proposed back in Act 3. **Approve** publishes it to the live playbook, **Reject** discards it, **Defer** holds it — Eric’s call alone.',
     run: () => { useStore.getState().openCanvas({ view: 'playbook', playbookId: 'pb_msa', playbookMode: 'suggestions' }) },
   },
   {
@@ -228,8 +276,8 @@ const STEPS: DemoStep[] = [
   },
   {
     phase: P4, persona: 'u_priya',
-    title: 'Full circle — the exact tag from Act 2',
-    body: 'That’s Kirsten’s **§12** tag from Act 2, right where Priya can act on it — one click to the clause. This is the loop closing: an attorney tags a contributor, and it surfaces here without anyone forwarding an email.',
+    title: 'Full circle — the exact tag from Act 3',
+    body: 'That’s Kirsten’s **§12** tag from Act 3, right where Priya can act on it — one click to the clause. This is the loop closing: an attorney tags a contributor, and it surfaces here without anyone forwarding an email.',
     run: () => { const s = useStore.getState(); s.openAgreement('AGR-2180', 'review'); s.navigate({ reviewMode: 'directive', reviewFocusRef: '§12' }) },
   },
 ]
