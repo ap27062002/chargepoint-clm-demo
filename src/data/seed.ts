@@ -392,6 +392,7 @@ export const notificationSeed: AppNotification[] = [
   { id: 'N-04', event: 'Redline received', body: 'Counterparty redline received for Vishay Intertechnology NDA (Draft 2).', channels: ['in_app', 'email'], ticket_id: 'TKT-1042', created_date: '2026-06-22T09:14:00', read: true, severity: 'info' },
   { id: 'N-05', event: 'Signature completed', body: 'Mondelez Mutual NDA fully executed via DocuSign.', channels: ['in_app', 'email', 'slack'], ticket_id: 'TKT-1009', created_date: '2026-05-19T13:22:00', read: true, severity: 'info' },
   { id: 'N-06', event: 'Playbook suggestions', body: '2 clauses suggested for the NDA playbook by attorneys — awaiting your approval.', channels: ['in_app'], ticket_id: 'TKT-1042', created_date: '2026-06-26T09:00:00', read: false, severity: 'info' },
+  { id: 'N-07', event: 'Redline received', body: 'Counterparty redline received for Northwind Master Services Agreement — uncapped liability, expanded indemnity (2 red lines flagged against the MSA playbook).', channels: ['in_app', 'email'], ticket_id: 'TKT-1031', created_date: '2026-06-19T16:20:00', read: false, severity: 'warning' },
 ]
 
 // ============================================================================
