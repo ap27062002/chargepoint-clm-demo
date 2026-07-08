@@ -1,0 +1,1108 @@
+import { useStore, agreementDeviations } from '@/store'
+import type { ChatMessage, ChatAction, ArtifactKind, Role } from '@/types'
+import { userById } from '@/data/seed'
+import { can, CAP_LABEL, ROLE_LABEL, ROLE_SCOPE, startersFor, type Capability } from '@/lib/access'
+import { canSeeTicket, visibleTickets } from '@/lib/scope'
+import { lookupCounterparty, inferDealContext } from '@/data/counterparties'
+import { precedentAnswer, precedentDigest, searchPrecedent } from '@/lib/precedent'
+import { answerFromState } from '@/lib/reason'
+import { consolidatedOpenCommentsRows, consolidatedOpenCommentsCsv, downloadCsv } from '@/lib/openComments'
+import { AS_OF } from '@/lib/analytics'
+export { GREETING } from '@/agent/greeting'
+
+let _c = 0
+const cid = () => `chat-${Date.now()}-${_c++}`
+const ts = () => new Date('2026-06-27T10:08:00').toISOString()
+
+interface AgentReply {
+  text: string
+  artifact?: { kind: ArtifactKind; refId?: string; title?: string }
+  actions?: ChatAction[]
+  effect?: () => void
+  widget?: { kind: 'ticket_source' }
+}
+
+type Intent = { name: string; test: (t: string) => boolean; reply: (t: string) => AgentReply; cap?: Capability }
+
+const has = (t: string, ...words: string[]) => words.some((w) => t.includes(w))
+
+const currentRole = (): Role => {
+  const s = useStore.getState()
+  return s.users.find((u) => u.id === s.currentUserId)!.role
+}
+
+function denial(role: Role, cap: Capability): AgentReply {
+  const starters = startersFor(role).slice(0, 2)
+  return {
+    text: `🔒 You don't have access to **${CAP_LABEL[cap]}**.\n\nYou're signed in as **${ROLE_LABEL[role]}**, so you can ${ROLE_SCOPE[role]}. That request is restricted to a different role.\n\nIf you're demoing access control, switch persona from the top-right avatar.`,
+    artifact: { kind: 'none' },
+    actions: starters.map((s, i) => ({ label: s.label, prompt: s.prompt, variant: i === 0 ? 'primary' as const : undefined })),
+  }
+}
+
+// ---- intent handlers --------------------------------------------------------
+const intents: Intent[] = [
+  {
+    // "Ask AI" on a highlighted clause in the document view.
+    name: 'explain_clause', cap: 'review',
+    test: (t) => has(t, 'explain this clause', 'flag any playbook risk', 'ask ai about this', 'what does this clause'),
+    reply: (t) => {
+      let body: string
+      if (has(t, 'residual')) {
+        body = `This is a **residuals** clause — a strict playbook **red line**. It would let the other side reuse anything their people "retain in memory," which guts trade-secret protection. **Recommendation: reject in full.** It's rejected in 100% of sampled deals and InfoSec treats it as a hard no.`
+      } else if (has(t, 'survive', 'years from', 'expire', 'termination', 'term of')) {
+        body = `This is a **term / survival** clause. Playbook baseline is a **2-year term with 5-year CI survival** (trade secrets indefinite). Approved fallbacks go to **3yr/3yr** then **3yr/2yr**. **Red line:** CI survival under 2 years, or trade-secret protection ending on expiry.`
+      } else if (has(t, 'governing', 'jurisdiction', 'venue', 'delaware', 'arbitration')) {
+        body = `This is a **governing law & venue** clause. Baseline is **Delaware law + Delaware courts**; approved fallbacks are counterparty home-state law (Delaware venue) or neutral New York. **Red line:** foreign governing law or ICC arbitration seated outside the U.S.`
+      } else if (has(t, 'injunctive', 'irreparable', 'bond')) {
+        body = `This is an **injunctive relief** clause. Baseline: mutual, no bond required. Approved fallback: leave the bond "as the court deems appropriate." **Red line:** relief available to the counterparty only, or a mandatory bond on ChargePoint.`
+      } else if (has(t, 'indemnif', 'liability', 'damages', 'consequential')) {
+        body = `This reads like an **indemnity / liability** term — generally **out of scope for an NDA** and one-sided when counterparties add it. **Recommendation: strike it** and keep remedies to injunctive relief, unless the deal team specifically wants it.`
+      } else {
+        body = `Mapped against the **NDA playbook**: I don't see a red-line trigger in this text. Confirm the defined terms ("Confidential Information", not "Proprietary") are used consistently and that any obligation is **mutual**. If you want, I can compare it to the matching playbook provision.`
+      }
+      return {
+        text: `**Clause analysis** — for the text you highlighted:\n\n${body}`,
+        artifact: { kind: 'none' },
+        actions: [
+          { label: 'Open the playbook', prompt: 'show me the NDA playbook' },
+          { label: 'Review the full redline', prompt: 'review the Vishay redline' },
+        ],
+      }
+    },
+  },
+  // ===== Eric round-3: ticket creation, comments parity, agent intake =====
+  {
+    name: 'create_ticket', cap: 'intake',
+    test: (t) => has(t, 'create a ticket', 'open a ticket', 'new ticket', 'create ticket') && !has(t, 'negotiation ticket', 'support ticket'),
+    reply: () => ({
+      text: `Happy to open a ticket. **What kind is it?**`,
+      artifact: { kind: 'none' },
+      actions: [
+        { label: 'Agreement negotiation', prompt: 'start a negotiation ticket', variant: 'primary' },
+        { label: 'General legal support (RFP review)', prompt: 'create a general legal support ticket for an RFP review' },
+      ],
+    }),
+  },
+  {
+    // Step 1 of the wizard — scope: single or multiple agreements.
+    name: 'negotiation_wizard_start', cap: 'intake',
+    test: (t) => has(t, 'start a negotiation ticket', 'negotiation ticket'),
+    reply: () => {
+      useStore.getState().startNegotiationWizard()
+      return {
+        text: `Happy to open a negotiation ticket. **Is this a single agreement or multiple agreements?**`,
+        artifact: { kind: 'none' },
+        actions: [
+          { label: 'Single agreement', prompt: 'single agreement', variant: 'primary' },
+          { label: 'Multiple agreements', prompt: 'multiple agreements' },
+        ],
+      }
+    },
+  },
+  {
+    // Step 2 — scope answered → ask for template(s) or an upload via the embedded widget.
+    name: 'negotiation_wizard_scope', cap: 'intake',
+    test: (t) => useStore.getState().negotiationWizard?.step === 'scope' && has(t, 'single agreement', 'multiple agreements'),
+    reply: (t) => {
+      const scope = has(t, 'multiple') ? 'multiple' : 'single'
+      useStore.getState().setWizardScope(scope)
+      return {
+        text: `Got it — **${scope === 'single' ? 'a single agreement' : 'multiple agreements'}**. Which template should I start from, or upload your own document?`,
+        artifact: { kind: 'none' },
+        widget: { kind: 'ticket_source' },
+      }
+    },
+  },
+  {
+    // Step 4 — counterparty captured, summary shown → user confirms.
+    name: 'negotiation_wizard_confirm', cap: 'intake',
+    test: (t) => useStore.getState().negotiationWizard?.step === 'confirm' && has(t, 'confirm ticket wizard', 'yes, create it', 'yes create it'),
+    reply: () => {
+      const { title } = useStore.getState().confirmNegotiationWizard()
+      return {
+        text: title
+          ? `Done — created **"${title}"** and opened the deal page — Deal Overview first. The draft is ready in **Agreement Review** whenever you want to start writing.`
+          : `Something went wrong building the ticket — let's try again.`,
+        artifact: { kind: 'none' },
+        actions: [],
+      }
+    },
+  },
+  {
+    name: 'negotiation_wizard_restart', cap: 'intake',
+    test: (t) => has(t, 'restart ticket wizard', 'start over'),
+    reply: () => {
+      useStore.getState().cancelNegotiationWizard()
+      useStore.getState().startNegotiationWizard()
+      return {
+        text: `No problem — let's start over. **Is this a single agreement or multiple agreements?**`,
+        artifact: { kind: 'none' },
+        actions: [
+          { label: 'Single agreement', prompt: 'single agreement', variant: 'primary' },
+          { label: 'Multiple agreements', prompt: 'multiple agreements' },
+        ],
+      }
+    },
+  },
+  {
+    name: 'create_ticket_support', cap: 'intake',
+    test: (t) => has(t, 'support ticket', 'legal support ticket'),
+    reply: (t) => {
+      const cp = t.match(/with ([a-z][\w .&-]+?)(?:[.,!]|$)/i)?.[1]?.trim()
+      const title = t.match(/for (?:an? )?(.+?)(?: with [\w .&-]+)?(?:[.,!]|$)/i)?.[1]?.trim()
+      const cpName = cp ? cp.replace(/\b\w/g, (c) => c.toUpperCase()) : 'Metro Transit Authority'
+      const ticketTitle = title ? title.charAt(0).toUpperCase() + title.slice(1) : 'RFP review — legal support'
+      return {
+        text: `Done — **General Legal Support** ticket **"${ticketTitle}"** created with **${cpName}** (no agreement attached). It gets a deal page with the **Deal Discussion** thread and **Open → In Progress → Resolved** tracking. Opening it now.`,
+        artifact: { kind: 'none' },
+        effect: () => useStore.getState().createTicketFull({ title: ticketTitle, kind: 'support', counterparty: cpName, files: [], attorneyId: 'u_kirsten' }),
+        actions: [],
+      }
+    },
+  },
+  {
+    // Legal-admin ticket assignment: "assign TKT-1042 to Kirsten and loop in Marcus for
+    // visibility." Admin-only (mirrors the Admin Console's assignment tab). Deterministic
+    // name matching against the real user directory — real but bounded, like the rest of
+    // this engine's NL parsing; free-text names outside that directory won't resolve.
+    name: 'assign_ticket_chat', cap: 'admin',
+    test: (t) => has(t, 'assign', 'reassign') && (has(t, 'ticket') || /\btkt-\d+\b/.test(t)),
+    reply: (t) => {
+      const s = useStore.getState()
+      const idMatch = t.match(/\btkt-\d+\b/)
+      const ticket = idMatch
+        ? s.tickets.find((x) => x.id.toLowerCase() === idMatch[0])
+        : (s.canvas.ticketId ? s.tickets.find((x) => x.id === s.canvas.ticketId) : undefined)
+      if (!ticket) {
+        return {
+          text: `Which ticket? Tell me the ticket number — e.g. "assign TKT-1042 to Kirsten and loop in Marcus for visibility" — or open the ticket first and just say "assign this ticket to Kirsten."`,
+          artifact: { kind: 'none' }, actions: [],
+        }
+      }
+      // Everything before a watcher keyword is the assignment clause (lead attorney); everything after is watchers.
+      const [assignClause, ...watcherParts] = t.split(/\b(?:loop in|involve|cc|give visibility to|also add)\b/)
+      const watcherClause = watcherParts.join(' ')
+      const nameHitIn = (clause: string) => (u: { name: string }) =>
+        u.name.toLowerCase().split(' ').some((part) => part.length > 2 && clause.includes(part))
+      const lead = s.users.filter((u) => u.role === 'attorney').find(nameHitIn(assignClause))
+      const watchers = s.users.filter((u) => u.id !== lead?.id && nameHitIn(watcherClause)(u))
+
+      if (!lead && watchers.length === 0) {
+        return {
+          text: `I couldn't match a name in that. Try: "assign ${ticket.id} to Kirsten and loop in Marcus for visibility."`,
+          artifact: { kind: 'ticket', refId: ticket.id }, actions: [],
+        }
+      }
+      const bits: string[] = []
+      if (lead) bits.push(`assigned lead attorney to **${lead.name}**`)
+      if (watchers.length) bits.push(`gave visibility to **${watchers.map((w) => w.name).join(', ')}**`)
+      return {
+        text: `Done — **${ticket.id}** (${ticket.title}): ${bits.join(' and ')}.`,
+        artifact: { kind: 'ticket', refId: ticket.id },
+        actions: [],
+        effect: () => useStore.getState().assignTicketTeam(ticket.id, {
+          leadAttorneyId: lead?.id,
+          watcherIds: watchers.length
+            ? Array.from(new Set([...(ticket.watcher_ids ?? []), ...watchers.map((w) => w.id)]))
+            : undefined,
+        }),
+      }
+    },
+  },
+  {
+    // Consolidated Open Comments report, aggregated (RBAC-scoped) across every matter — as
+    // opposed to open_comments_doc below, which is a single-document list. Must stay ahead of
+    // it in this array since both tests match on the "open comments" substring.
+    // "Show open comments" — the explicit follow-up action from open_comments_report below (or
+    // typed directly). Must stay ahead of open_comments_report since "show open comments report"
+    // also contains the substring "open comments report".
+    name: 'open_comments_report_show', cap: 'pipeline',
+    test: (t) => has(t, 'show open comments', 'show the open comments', 'show comments report'),
+    reply: () => ({
+      text: `Opening the consolidated open comments report.`,
+      artifact: { kind: 'none' },
+      actions: [],
+      effect: () => useStore.getState().setOpenCommentsReportOpen(true),
+    }),
+  },
+  {
+    // "Download open comments" — exports the CSV directly, no modal. Same ordering note as above.
+    name: 'open_comments_report_download', cap: 'pipeline',
+    test: (t) => has(t, 'download open comments', 'download the open comments', 'download comments report', 'export open comments'),
+    reply: () => {
+      const s = useStore.getState()
+      const cu = s.users.find((u) => u.id === s.currentUserId)!
+      const scoped = new Set(visibleTickets(s.tickets, s.messages, cu).map((tk) => tk.id))
+      const rows = consolidatedOpenCommentsRows(s.messages, s.tickets, s.agreements, scoped, AS_OF)
+      return {
+        text: rows.length ? `Exported **${rows.length}** open comment${rows.length === 1 ? '' : 's'} as a CSV.` : `No open comments to export right now.`,
+        artifact: { kind: 'none' },
+        actions: [],
+        effect: rows.length ? () => {
+          downloadCsv(consolidatedOpenCommentsCsv(rows), `Consolidated_Open_Comments_${AS_OF}.csv`)
+          useStore.getState().setToast('Consolidated open-comments report exported.')
+        } : undefined,
+      }
+    },
+  },
+  {
+    // cap:'pipeline' (not 'review') deliberately — administrators lack 'review' but should still
+    // get portfolio-wide comment oversight; 'pipeline' is the one capability every role holds.
+    name: 'open_comments_report', cap: 'pipeline',
+    test: (t) => has(t, 'open comments report', 'consolidated open comments', 'open comments across', 'consolidated report', 'open comments for all', 'open comments everywhere'),
+    reply: () => {
+      const s = useStore.getState()
+      const cu = s.users.find((u) => u.id === s.currentUserId)!
+      const scoped = new Set(visibleTickets(s.tickets, s.messages, cu).map((tk) => tk.id))
+      const rows = consolidatedOpenCommentsRows(s.messages, s.tickets, s.agreements, scoped, AS_OF)
+      const matters = new Set(rows.map((r) => r.m.ticket_id)).size
+      return {
+        text: rows.length
+          ? `**Consolidated open comments** — ${rows.length} unresolved across ${matters} matter${matters === 1 ? '' : 's'} visible to you. Want to see them or export a CSV?`
+          : `No open comments anywhere across your matters right now. 🎉`,
+        artifact: { kind: 'none' },
+        actions: rows.length ? [
+          { label: 'Show comments', prompt: 'show open comments report', variant: 'primary' },
+          { label: 'Download comments', prompt: 'download open comments report' },
+        ] : [],
+      }
+    },
+  },
+  {
+    // Comments §4 — parity: same list as the Open Comments report.
+    name: 'open_comments_doc', cap: 'review',
+    test: (t) => has(t, 'open comments'),
+    reply: (t) => {
+      const s = useStore.getState()
+      const agId = has(t, 'northwind') || !has(t, 'vishay') ? 'AGR-2180' : 'AGR-2201'
+      const ag = s.agreements.find((a) => a.id === agId)
+      const rows = s.messages.filter((m) => m.agreement_id === agId && !m.resolved)
+      const lines = rows.map((m) => {
+        const days = Math.max(0, Math.round((new Date('2026-06-27').getTime() - new Date(m.created_date.slice(0, 10)).getTime()) / 86400000))
+        const who = (m.mentions ?? []).map((id) => userById(id)?.name.split(' ')[0]).join(', ')
+        return `- **${m.provision_reference ?? 'general'}** — "${m.body.slice(0, 90)}${m.body.length > 90 ? '…' : ''}" ${who ? `· @${who}` : ''} · **${days}d open**`
+      })
+      return {
+        text: rows.length
+          ? `**Open comments on the ${ag?.title ?? 'document'}** — ${rows.length}:\n\n${lines.join('\n')}\n\nUse **Open Comments** on the deal page to send reminders or export this as a report.`
+          : `No open comments on the ${ag?.title ?? 'document'} right now.`,
+        artifact: { kind: 'agreement', refId: agId, title: `${ag?.title} — open comments` },
+        actions: [],
+      }
+    },
+  },
+  {
+    // Intake §2 — agent intake path: which of the three Northwind documents?
+    name: 'intake_new_version', cap: 'review',
+    test: (t) => has(t, 'new version') && has(t, 'northwind'),
+    reply: () => ({
+      text: `Got the file. Northwind has **three documents** on this deal — which one does it belong to?\n\n1. **MSA** — Northwind Master Services Agreement (v3 current)\n2. **DPA** — Data Processing Addendum\n3. **SOW** — Initial SOW`,
+      artifact: { kind: 'none' },
+      actions: [
+        { label: 'File it as the MSA', prompt: 'file it as the northwind msa', variant: 'primary' },
+        { label: 'It belongs to the DPA', prompt: 'file it as the northwind dpa' },
+        { label: 'It belongs to the SOW', prompt: 'file it as the northwind sow' },
+      ],
+    }),
+  },
+  {
+    name: 'intake_file_doc', cap: 'review',
+    test: (t) => has(t, 'file it as the northwind'),
+    reply: (t) => {
+      const agId = has(t, 'dpa') ? 'AGR-2181' : has(t, 'sow') ? 'AGR-2182' : 'AGR-2180'
+      const type = has(t, 'dpa') ? 'DPA' : has(t, 'sow') ? 'SOW' : 'MSA'
+      return {
+        text: `Filed as **${type} v4 (Counterparty Response, 4 Jul 2026)** ✓\n\nMatched via **embedded ID CLM-NWE-${type}-00${type === 'MSA' ? 3 : 1}** (the identifier survives round-trips in document metadata — it's not visible in the body). The deal page and version history are updated; opening the document.`,
+        artifact: { kind: 'agreement', refId: agId, title: `Northwind ${type} — v4 ingested` },
+        effect: () => useStore.getState().ingestVersion(agId, 'NWE_MSA_returned_4Jul.docx'),
+        actions: [],
+      }
+    },
+  },
+  // ===== build-12: Eric's use-case feedback =====
+  {
+    name: 'send_back', cap: 'disposition',
+    test: (t) => has(t, 'send back', 'send the clean copy', 'clean copy and redline', 'send our redline', 'send the redline back', 'send it back to the counterparty', 'return to counterparty'),
+    reply: () => ({
+      text: `Opening the **send-back** panel for the Vishay NDA. I'll assemble a **clean copy** (your working copy with changes accepted) plus a **redline vs their Draft 2** (non-cumulative), and can draft an internal or external **summary of the changes**. Nothing goes out until you send it — status then moves to **In Negotiation**.`,
+      artifact: { kind: 'send_back', refId: 'AGR-2201', title: 'Vishay NDA — send back (clean copy + redline)' },
+      actions: [],
+    }),
+  },
+  {
+    name: 'generate_redline', cap: 'disposition',
+    test: (t) => has(t, 'generate the redline', 'generate a redline', 'produce a redline', 'redline document', 'clean copy plus redline'),
+    reply: () => ({
+      text: `Generating the **redline document** — your clean copy vs the counterparty's last version, word-level. Open it below; you can switch the comparison version or make it cumulative (e.g. V-latest vs V1), then send a clean copy + redline.`,
+      artifact: { kind: 'redline_doc', refId: 'AGR-2201', title: 'Vishay NDA — redline document' },
+      actions: [],
+    }),
+  },
+  {
+    name: 'summarize_changes', cap: 'disposition',
+    test: (t) => (has(t, 'summarize the changes', 'summary of changes', 'summarize my changes', 'summarize our changes', 'change summary', 'draft a summary of the changes')) && !has(t, 'deal summary', 'mondelez'),
+    reply: () => ({
+      text: `I can draft a **summary of the changes** — an **internal** version (for a sales rep or contributor) or an **external** version (for the counterparty). Open the send-back panel below, generate the redline, and pick the audience.`,
+      artifact: { kind: 'send_back', refId: 'AGR-2201', title: 'Vishay NDA — change summary' },
+      actions: [],
+    }),
+  },
+  {
+    name: 'accept_all_clean', cap: 'disposition',
+    test: (t) => (has(t, 'accept all', 'accept everything', 'make a clean copy', 'accept the changes')) && !has(t, 'recommended'),
+    reply: () => ({
+      text: `Accepted all tracked changes on the working copy — it's now a **clean copy**. Attorneys can't carry cumulative track-changes across versions; once accepted, the doc is clean and I redline it against the counterparty's version. Open it below, then assemble the clean copy + redline.`,
+      artifact: { kind: 'document', refId: 'AGR-2201', title: 'Vishay NDA — clean copy' },
+      effect: () => useStore.getState().acceptAllChanges('V-2201-2'),
+      actions: [{ label: 'Assemble clean copy + redline', prompt: 'send the clean copy and redline back to the counterparty', variant: 'primary' }],
+    }),
+  },
+  {
+    name: 'execute_deal', cap: 'disposition',
+    test: (t) => has(t, 'execute the deal', 'sign all', 'execute all', 'sign the deal', 'send all for signature', 'sign multiple', 'execute the northwind', 'sign the northwind'),
+    reply: () => ({
+      text: `Opening **deal execution** for Northwind — this ticket has multiple documents (MSA, DPA, SOW). Select which to sign and route them **all together** or **individually** (the SOW is ready to sign now; the MSA is still in redline). I can't sign — each DocuSign envelope is yours to advance.`,
+      artifact: { kind: 'deal_execution', refId: 'TKT-1031', title: 'Northwind — execute & sign' },
+      actions: [],
+    }),
+  },
+  {
+    name: 'deal_overview', cap: 'review',
+    test: (t) => has(t, 'deal overview', 'documents on this ticket', 'all the documents', 'the whole deal', 'multiple documents', 'northwind deal', 'all agreements on', 'open the northwind'),
+    reply: () => ({
+      text: `Opening the **Northwind deal** — all three agreements (MSA, DPA, SOW) on one ticket, each with its stage and whose court it's in, plus deal-level discussion. Open any document, or execute the ones that are ready.`,
+      artifact: { kind: 'ticket', refId: 'TKT-1031', title: 'Northwind Energy — deal' },
+      actions: [{ label: 'Execute & sign', prompt: 'execute the northwind deal', variant: 'primary' }],
+    }),
+  },
+  {
+    name: 'suggest_to_playbook', cap: 'playbook_suggest',
+    test: (t) => has(t, 'suggest') && has(t, 'playbook')
+      && !has(t, 'review', 'suggestions', 'suggested addition', 'suggestion queue', 'creating a playbook', 'a playbook for', 'create a playbook'),
+    reply: (t) => {
+      const kind = has(t, 'red line', 'red-line', 'redline') ? 'red_line' as const : has(t, 'default', 'standard') ? 'default' as const : 'fallback' as const
+      const m = t.match(/(?:add to playbook(?: as [a-z ]+)?:?|to the playbook:?)\s*(.{2,140})/i)
+      const text = (m?.[1] || 'the highlighted clause language').trim()
+      // Derive the target playbook + source from the agreement currently open (not hardcoded to Vishay/NDA).
+      const st = useStore.getState()
+      const ag = st.agreements.find((a) => a.id === st.canvas.agreementId)
+      const pbId = ag?.playbook_id ?? 'pb_nda'
+      const pbName = st.playbooks.find((p) => p.id === pbId)?.name ?? 'the playbook'
+      return {
+        text: `Sent to the **playbook owner** for approval — proposed as a **${kind.replace('_', ' ')}** for *${pbName}*. It lands in Playbook → **Suggested additions**; once approved it's added and the agent flags it automatically from then on.`,
+        artifact: { kind: 'playbook_suggestions', title: 'Playbook — suggested additions' },
+        effect: () => { const s = useStore.getState(); const a = s.agreements.find((x) => x.id === s.canvas.agreementId); s.suggestToPlaybook({ playbook_id: a?.playbook_id ?? 'pb_nda', provision_name: 'Suggested clause', kind, proposed_text: text, source_agreement_id: a?.id ?? 'AGR-2201' }) },
+        actions: [{ label: 'Review the suggestion queue', prompt: 'review playbook suggestions', variant: 'primary' }],
+      }
+    },
+  },
+  {
+    name: 'playbook_suggestions_view', cap: 'playbook_view',
+    test: (t) => has(t, 'playbook suggestions', 'suggested additions', 'suggested changes to the playbook', 'review playbook', 'suggestion queue', 'new changes in playbook', 'review 2 new changes'),
+    reply: () => ({
+      text: `Opening the **Suggested additions** queue — clauses attorneys have proposed for the playbook, each with the source deal and rationale. As owner you can **approve** (adds it to the playbook) or **reject**.`,
+      artifact: { kind: 'playbook_suggestions', title: 'Playbook — suggested additions' },
+      actions: [],
+    }),
+  },
+  {
+    // Refine an in-progress playbook DRAFT in natural language (add/remove/re-tier provisions).
+    // Guarded to only fire while a generated draft is open, so it never shadows create/restructure.
+    name: 'refine_playbook_draft', cap: 'playbook_edit',
+    test: (t) => {
+      const s = useStore.getState()
+      const d = s.playbookDrafts.find((x) => x.id === s.canvas.playbookDraftId) ?? s.playbookDrafts[0]
+      return !!d && d.stage === 'generated' && (has(t, 'add a', 'add an', 'include a', 'remove the', 'delete the', 'drop the', 're-tier', 'retier') && has(t, 'provision', 'clause', 'red line', 'redline', 'fallback', 'baseline'))
+    },
+    reply: (t) => {
+      const s = useStore.getState()
+      const d = s.playbookDrafts.find((x) => x.id === s.canvas.playbookDraftId) ?? s.playbookDrafts[0]
+      const confirm = s.refinePlaybookDraft(d.id, t)
+      return {
+        text: `${confirm}\n\nReview the updated provisions in the builder, then **Publish** when it's ready.`,
+        artifact: { kind: 'playbook_create', title: 'Refine playbook draft' },
+        actions: [{ label: 'Publish playbook', prompt: 'publish the playbook', variant: 'primary' }],
+      }
+    },
+  },
+  {
+    name: 'create_playbook', cap: 'playbook_edit',
+    test: (t) => has(t, 'create a playbook', 'create my playbook', 'create the playbook', 'new playbook', 'build a playbook', 'build the playbook', 'build my playbook', 'create playbook', 'make a playbook', 'make the playbook')
+      && !has(t, 'restructure', 'refine', 'suggestion'),
+    reply: (t) => {
+      // R48/R49 — infer the agreement type + resolve the default source folder for it (no path needed).
+      const type: 'MSA' | 'MNDA' = has(t, 'msa', 'master service', 'services agreement') ? 'MSA' : 'MNDA'
+      const s = useStore.getState()
+      const folder = s.playbookSourceDefaults[type]
+      const exampleN = folder?.exampleAgreementIds.length ?? 0
+      return {
+        text: `Let's build a **${type === 'MSA' ? 'MSA' : 'NDA'} playbook**. I'll start from the default source folder **${folder?.path ?? '(none set)'}** — the ${type} template plus **${exampleN} example agreement${exampleN === 1 ? '' : 's'}** — analyze how each example resolved every section, and derive the provisions. You review, refine by chat, and publish. Open the builder below (adjust the folder/examples there).`,
+        artifact: { kind: 'playbook_create', title: `Create a ${type === 'MSA' ? 'MSA' : 'NDA'} playbook` },
+        effect: () => useStore.getState().startPlaybookDraft(`New ${type === 'MSA' ? 'MSA' : 'NDA'} Playbook`, type, `Create a ${type} playbook from ${folder?.path ?? 'the default folder'}`),
+        actions: [],
+      }
+    },
+  },
+  {
+    name: 'playbook_restructure', cap: 'playbook_edit',
+    test: (t) => (has(t, 'restructure the playbook', 'reorganize the playbook', 'reformat the playbook', 'nest ', 'group by category', 'flatten the playbook', 're-tier', 'render the playbook', 'render as', 'render this as', 'counterparty-facing', 'counterparty facing', 'training view', 'reorder', 'set the theme', 'accent colo')
+      || /make .* (a |an )?(fallback|red ?line|baseline)/.test(t) || /promote .* to a red/.test(t) || /put .* first/.test(t))
+      && !has(t, 'draft', 'create a playbook', 'create the playbook'),
+    reply: (t) => {
+      // R52/R57/R58/R60 — perform the REAL transform on the currently-open published playbook.
+      const s = useStore.getState()
+      const pbId = s.canvas.playbookId ?? 'pb_nda'
+      const pbName = s.playbooks.find((p) => p.id === pbId)?.name ?? 'the playbook'
+      const msg = s.restructurePlaybook(pbId, t)
+      return {
+        text: `${msg}\n\n(Applied to **${pbName}** — the backend still uses the same positions to detect deviations regardless of how it's rendered.)`,
+        artifact: { kind: 'playbook', refId: pbId, title: pbName },
+        effect: () => useStore.getState().setPlaybook(pbId),
+        actions: [{ label: 'Open the playbook', prompt: 'show me the playbook', variant: 'primary' }],
+      }
+    },
+  },
+  {
+    name: 'create_template_project', cap: 'templates',
+    test: (t) => has(t, 'create a template', 'new template', 'build a template', 'build a new template', 'create a new template', 'template project'),
+    reply: () => ({
+      text: `Opening **Templates** to build a new form template. Point me at **precedent** ChargePoint agreements + **third-party standards**, and I'll generate a template modeled on the standards but carrying our concepts — you iterate with me, save it to the library, and can build a playbook from it. Your Claude Projects flow, made enterprise.`,
+      artifact: { kind: 'projects', title: 'Templates' },
+      actions: [],
+    }),
+  },
+  {
+    name: 'templates_folder', cap: 'templates',
+    test: (t) => has(t, 'template projects', 'open projects', 'templates folder', 'projects workspace', 'my templates', 'template library', 'open the projects'),
+    reply: () => ({
+      text: `Opening **Templates** — your template-building workspace and the library of saved templates (the NDA and MSA templates that seed the playbooks). Start a new template to build a form agreement from precedent.`,
+      artifact: { kind: 'projects', title: 'Templates' },
+      actions: [],
+    }),
+  },
+  {
+    name: 'tagged',
+    test: (t) => has(t, 'tagged', 'assigned to me', 'my plate', "what's on me", 'waiting on me', 'sign-off', 'sign off'),
+    reply: () => {
+      const s = useStore.getState()
+      const uid = s.currentUserId
+      const role = s.users.find((u) => u.id === uid)!.role
+      const first = userById(uid)?.name.split(' ')[0]
+      const mentions = s.messages.filter((m) => m.mentions?.includes(uid) && !m.resolved)
+      const myTickets = s.tickets.filter((t) => t.assigned_attorney_id === uid && t.status !== 'Executed' && t.status !== 'Resolved')
+      const agTitle = (id?: string | null) => s.agreements.find((a) => a.id === id)?.title ?? 'a deal'
+      const onVishay = mentions.some((m) => m.agreement_id === 'AGR-2201')
+      const ageOf = (c: string) => Math.max(0, Math.round((new Date('2026-06-27').getTime() - new Date(c.slice(0, 10)).getTime()) / 86400000))
+      const mentionLines = mentions.slice().sort((a, b) => ageOf(b.created_date) - ageOf(a.created_date)).slice(0, 5).map((m) => `• **${agTitle(m.agreement_id)}**${m.provision_reference ? ` — ${m.provision_reference}` : ''}: “${m.body.length > 90 ? m.body.slice(0, 90) + '…' : m.body}” _(from ${userById(m.author_id)?.name.split(' ')[0]} · **${ageOf(m.created_date)}d waiting**)_`).join('\n')
+
+      // Contributors (InfoSec, Finance, …) don't own tickets — their plate is the sign-off requests they're tagged on.
+      if (role === 'contributor' || (mentions.length > 0 && myTickets.length === 0)) {
+        return {
+          text: mentions.length
+            ? `Here's what's waiting on you, ${first}. You've been tagged for **sign-off on ${mentions.length} provision${mentions.length === 1 ? '' : 's'}**:\n\n${mentionLines}\n\nOpen the document to weigh in, then the attorney can mark your sign-off received.`
+            : `Nothing is waiting on your sign-off right now, ${first}. When an attorney @-tags you on a provision, it'll show up here with a one-click link to the clause.`,
+          artifact: { kind: 'tagged_items', title: 'My sign-off requests' },
+          actions: mentions.length
+            ? [onVishay ? { label: 'Open the flagged document', prompt: 'review the Vishay redline', variant: 'primary' as const } : { label: 'Show the dashboard', prompt: 'show me the dashboard', variant: 'primary' as const }]
+            : [{ label: 'Show the dashboard', prompt: 'show me the dashboard', variant: 'primary' as const }],
+        }
+      }
+      // Attorneys / owners: assigned tickets + the provisions others have asked them to weigh in on.
+      return {
+        text: `Here's everything currently on your plate, ${first}.\n\n**${mentions.length} provision sign-off${mentions.length === 1 ? '' : 's'} awaiting you** and **${myTickets.length} active ticket${myTickets.length === 1 ? '' : 's'}** assigned to you.${mentions.length ? `\n\n${mentionLines}` : ''}\n\nThe Airbus NDA (TKT-1039) is at **80% of its SLA window** — I'd take that first.`,
+        artifact: { kind: 'tagged_items', title: 'My queue & tagged items' },
+        actions: [
+          { label: 'Open Airbus (SLA risk)', prompt: 'open ticket TKT-1039', variant: 'primary' },
+          { label: 'Review Vishay redline', prompt: 'review the Vishay redline' },
+        ],
+      }
+    },
+  },
+  {
+    name: 'review_redline', cap: 'review',
+    test: (t) => has(t, 'redline', 'red line', 'review the', 'analyz', 'deviation', 'vishay', 'walk me through')
+      && !has(t, 'signature', 'sign', 'execute', 'docusign', 'summary', 'summarize'),
+    reply: () => {
+      const s = useStore.getState()
+      const devs = agreementDeviations(s, 'AGR-2201')
+      const open = devs.filter((d) => d.disposition_status === 'open').length
+      const red = devs.filter((d) => d.risk_category === 'red_line').length
+      const neg = devs.filter((d) => d.risk_category === 'negotiate').length
+      const acc = devs.filter((d) => d.risk_category === 'accept').length
+      const qa = devs.length - red - neg - acc
+      // Lead issue is DERIVED from the computed set (highest-risk open item), not hardcoded.
+      const rank: Record<string, number> = { red_line: 0, negotiate: 1, missing: 2, enhancement: 3, new: 4, accept: 5 }
+      const top = [...devs].sort((a, b) => (rank[a.risk_category] ?? 9) - (rank[b.risk_category] ?? 9))[0]
+      const lead = top ? `The one that matters most: **${top.provision_name} (${top.section_reference})** — ${top.recommended_response}` : 'No deviations detected.'
+      return {
+        text: `I diffed **Vishay's Draft 2** against the prior version, mapped each change to the NDA playbook, and classified it. That analysis produced **${devs.length} issues** — ${red} red line, ${neg} negotiate, ${acc} accept${qa > 0 ? `, ${qa} QA flag${qa === 1 ? '' : 's'}` : ''}.\n\n${lead}\n\n${open} are still open. **Open the Issues View** (below, sorted by risk) to step through them — Apply / Skip / Reject each, or I can apply all recommended dispositions.`,
+        artifact: { kind: 'redline_review', refId: 'AGR-2201', title: 'Open the Issues View — Vishay redline' },
+        actions: [
+          { label: 'Apply all recommended', prompt: 'apply all recommended dispositions to Vishay', variant: 'primary' },
+          { label: 'Why is residuals a red line?', prompt: 'why is the residuals clause a red line?' },
+          { label: 'Draft our response', prompt: 'generate our redline response for Vishay' },
+        ],
+      }
+    },
+  },
+  {
+    name: 'residuals_explain', cap: 'review',
+    test: (t) => has(t, 'residual') && has(t, 'why', 'red line', 'explain', 'exposure', 'guidance'),
+    reply: () => {
+      // Precedent line is COMPUTED from the real corpus (R44) — no fabricated deals.
+      const prec = searchPrecedent('residuals')
+      const precLine = prec.length
+        ? prec.map((p) => `${p.counterparty} (${p.section}, ${p.disposition})`).join('; ')
+        : 'no executed ChargePoint agreement contains a residuals clause — there is no accepted precedent for it (Vishay §1(f) is the only introduction, and it is live).'
+      return {
+      text: `**Residuals — playbook red line (do not accept).**\n\nA residuals clause lets the other side freely use anything their people "retain in unaided memory" — ideas, know-how, techniques — for any purpose. In practice it **guts trade-secret protection**: an engineer who saw our battery-evaluation data could reuse it and argue it was just "in their memory."\n\n- **Playbook position:** §4 exclusions are the five standard ones only. Residuals is listed as a strict red line.\n- **Precedent:** ${precLine}\n- **InfoSec (Priya Anand):** has separately flagged it as a hard no on this deal.\n\n**Recommendation:** reject §1(f) in full in our response. I've marked it accordingly in the Issues View.`,
+      artifact: { kind: 'redline_review', refId: 'AGR-2201', title: 'Vishay NDA — Residuals (§1(f))' },
+      actions: [
+        { label: 'Reject §1(f) residuals', prompt: 'reject the residuals deviation', variant: 'primary' },
+        { label: 'Show the playbook clause', prompt: 'show me the NDA playbook' },
+      ],
+      }
+    },
+  },
+  {
+    // R44 — chat against executed precedent. Answer is COMPUTED from the real corpus (no fabrication).
+    name: 'precedent_lookup', cap: 'review',
+    test: (t) => has(t, 'precedent', 'have we done', 'has this been done', 'what did we do on', 'prior deal', 'previously executed', 'on the mondelez', 'on the clever', 'accepted before', 'ever accepted', 'ever rejected', "what's our history"),
+    reply: (t) => ({
+      text: precedentAnswer(t) + `\n\n_Grounded in ChargePoint's executed-agreement corpus. Open the contracts list to verify any citation._`,
+      artifact: { kind: 'contracts', title: 'Executed precedent' },
+      actions: [{ label: 'Open executed contracts', prompt: 'show me all contracts', variant: 'primary' }],
+    }),
+  },
+  {
+    name: 'apply_all', cap: 'disposition',
+    test: (t) => has(t, 'apply all', 'accept all recommended', 'apply recommended', 'apply all recommended'),
+    reply: () => ({
+      text: `Done — I applied the **recommended disposition** to every open deviation on the Vishay NDA: accepts confirmed, the red lines (residuals) rejected, and the rest set to counter at the approved fallback. Nothing was sent anywhere — these are internal dispositions for your review.\n\nYou can still override any single item in the Issues View. When you're ready, I can generate our **clean + redline response** for your approval.`,
+      artifact: { kind: 'redline_review', refId: 'AGR-2201', title: 'Vishay NDA — dispositions applied' },
+      effect: () => useStore.getState().applyAllRecommended('AGR-2201'),
+      actions: [
+        { label: 'Generate our response', prompt: 'generate our redline response for Vishay', variant: 'primary' },
+        { label: 'Open the document', prompt: 'open the vishay document' },
+      ],
+    }),
+  },
+  {
+    name: 'reject_residual', cap: 'disposition',
+    test: (t) => has(t, 'reject') && has(t, 'residual'),
+    reply: () => ({
+      text: `Rejected **§1(f) Residuals**. It's marked *rejected* in the Issues View and will be struck in our response, with a short note citing our standard position. InfoSec's concurrence is logged on the thread.`,
+      artifact: { kind: 'redline_review', refId: 'AGR-2201', title: 'Vishay NDA — residuals rejected' },
+      effect: () => useStore.getState().setDisposition('D-02', 'rejected'),
+      actions: [{ label: 'Generate our response', prompt: 'generate our redline response for Vishay', variant: 'primary' }],
+    }),
+  },
+  {
+    name: 'generate_response', cap: 'disposition',
+    test: (t) => has(t, 'generate', 'draft our', 'our response', 'redline response', 'counter', 'clean copy', 'clean and redline')
+      && !has(t, 'use defaults', 'create an nda', 'new nda', 'create a new nda'),
+    reply: () => ({
+      text: `I've prepared **ChargePoint's response (V3)** to Vishay based on your dispositions:\n\n- **Removed** §1(f) Residuals (red line).\n- **Countered** Term to **3 years / 3-year CI survival** (Fallback 1); trade-secret carve-out preserved.\n- **Countered** Injunctive Relief — kept mutual, bond "as the court deems appropriate."\n- **Qualified** Affiliate liability to Affiliates receiving Confidential Information.\n- **Corrected** the defined-term inconsistency ("Proprietary" → "Confidential Information") throughout.\n- **Accepted** the legal-hold copy and oral-disclosure window.\n\nOutput is ready as a **clean copy** and a **redline** vs. their Draft 2. Internal CLM comments are kept out of the delivered file.\n\n⚠️ I can't send this externally — that needs your approval and goes out under your signature.`,
+      artifact: { kind: 'agreement', refId: 'AGR-2201', title: 'Vishay NDA — V3 (CP response)' },
+      actions: [
+        { label: 'Approve & prepare to send', prompt: 'send the Vishay response to the counterparty', variant: 'primary' },
+        { label: 'Open document view', prompt: 'open the vishay document' },
+      ],
+    }),
+  },
+  {
+    name: 'send_external', cap: 'disposition',
+    test: (t) => has(t, 'send') && has(t, 'counterparty', 'vishay', 'external', 'airbus', 'them'),
+    reply: () => ({
+      text: `Prepared the outbound package and a draft cover email to Vishay's counsel — **but I won't send it myself.** Per policy, the AI cannot deliver documents externally or execute signatures; external delivery is an **attorney-approved** action sent from your account.\n\n**Ready for your approval:**\n- ✅ Clean V3 (internal comments stripped)\n- ✅ Redline vs Draft 2\n- ✅ Draft cover note summarizing our three counters\n\nApprove below and I'll stage it in Outlook for you to send; the ticket will move to **Sent to Counterparty** and the ball flips to their court.`,
+      artifact: { kind: 'agreement', refId: 'AGR-2201', title: 'Vishay NDA — ready to send' },
+      actions: [
+        { label: 'Approve external delivery', prompt: 'approve and stage the Vishay delivery in Outlook', variant: 'primary' },
+        { label: 'Edit the cover note', prompt: 'edit the cover note' },
+      ],
+    }),
+  },
+  {
+    name: 'approve_send', cap: 'disposition',
+    test: (t) => has(t, 'approve') && has(t, 'send', 'deliver', 'outlook', 'stage', 'delivery'),
+    reply: () => {
+      return {
+        text: `Approved and staged in Outlook under your account. ✅\n\n- Ticket **TKT-1042 → Sent to Counterparty**\n- Ball in court → **Counterparty**\n- Audit events logged (\`document_sent\`), notification sent to Marcus Reed.\n\nI'll watch for their response and run redline analysis automatically when it lands.`,
+        artifact: { kind: 'dashboard', title: 'Pipeline updated' },
+        effect: () => {
+          const st = useStore.getState()
+          useStore.setState({
+            tickets: st.tickets.map((t) => (t.id === 'TKT-1042' ? { ...t, status: 'Sent to Counterparty' } : t)),
+            agreements: st.agreements.map((a) => (a.id === 'AGR-2201' ? { ...a, status: 'sent_to_counterparty', ball_in_court: 'counterparty' } : a)),
+          })
+          st.audit_push({ event_type: 'document_sent', ticket_id: 'TKT-1042', agreement_id: 'AGR-2201', actor_id: st.currentUserId, summary: 'V3 sent to Vishay Intertechnology (attorney-approved).' })
+          st.audit_push({ event_type: 'status_changed', ticket_id: 'TKT-1042', summary: 'TKT-1042 → Sent to Counterparty.' })
+        },
+        actions: [
+          { label: 'Route for e-signature', prompt: 'route the Vishay NDA for signature', variant: 'primary' },
+          { label: 'Back to dashboard', prompt: 'show me the dashboard' },
+        ],
+      }
+    },
+  },
+  {
+    name: 'lifecycle', cap: 'review',
+    test: (t) => has(t, 'lifecycle', 'what stage', 'which stage', 'stage of', 'approval chain', 'approvals', 'how does it move', 'how will it move', 'next step', 'move from redlin', 'how an agreement'),
+    reply: () => ({
+      text: `Each agreement moves through this lifecycle:\n\n**Draft → Internal Review → Sent to Counterparty → Redline Received → In Negotiation → Ready to Sign → Executed**\n\nSending the counterparty our redline puts the ball back in their court (In Negotiation); when terms are final it moves to **Ready to Sign** and executes through DocuSign. Open the Vishay NDA below — the **lifecycle bar at the top** shows the current stage, the "Advance" / "Send back to counterparty" action, and any pending approvals inline.`,
+      artifact: { kind: 'redline_review', refId: 'AGR-2201', title: 'Vishay NDA — lifecycle & approvals' },
+      actions: [{ label: 'Advance to the next stage', prompt: 'advance the Vishay NDA to the next stage', variant: 'primary' }],
+    }),
+  },
+  {
+    name: 'advance_stage', cap: 'disposition',
+    test: (t) => has(t, 'advance', 'next stage', 'move it forward', 'move forward', 'progress the', 'move to next', 'send to internal', 'internal review'),
+    reply: () => ({
+      text: `Advancing the **Vishay NDA** to its next stage. If the next step is **Sent to Counterparty**, I route it through the **approval chain** first — it appears in the lifecycle bar with Grant/Deny, and I can't deliver externally until it's approved.`,
+      artifact: { kind: 'redline_review', refId: 'AGR-2201', title: 'Vishay NDA — lifecycle' },
+      effect: () => useStore.getState().advanceAgreementStage('AGR-2201'),
+      actions: [{ label: 'Route for e-signature', prompt: 'route the Vishay NDA for signature' }],
+    }),
+  },
+  {
+    name: 'execute', cap: 'disposition',
+    test: (t) => has(t, 'execute', 'docusign', 'signature', 'send for signature', 'route for signature', 'e-sign', 'esign', 'for signing'),
+    reply: () => ({
+      text: `The **execution flow** for the Vishay NDA is ready. It runs the **approval chain** → **DocuSign envelope** (ChargePoint signer, then counterparty) → **archive** → status **Executed** → an auto-generated **deal summary**. I can't sign — each step is yours to advance. Open it below.`,
+      artifact: { kind: 'execution', refId: 'AGR-2201', title: 'Vishay NDA — execution & e-sign' },
+      actions: [],
+    }),
+  },
+  {
+    // R79 — a pure inquiry (a question, no agreement) → logged as an inquiry ticket + drafted response.
+    name: 'create_inquiry', cap: 'intake',
+    test: (t) => (has(t, 'log an inquiry', 'log a question', 'i have a question', 'legal question', 'ask legal', 'quick question', 'just a question', 'no agreement, just', 'open an inquiry', 'raise an inquiry'))
+      && !has(t, 'create an nda', 'draft an nda', 'new nda'),
+    reply: (t) => {
+      const q = t.replace(/^.*?(question|inquiry)[:,]?\s*/i, '').trim() || t
+      return {
+        text: `Logged that as an **inquiry** (no agreement attached) and drafted a response from the playbook + executed precedent — open it to review, edit, or tag an attorney for sign-off.`,
+        artifact: { kind: 'ticket', title: 'Inquiry — drafted response' },
+        effect: () => useStore.getState().createInquiry(q),
+        actions: [],
+      }
+    },
+  },
+  {
+    name: 'create_nda', cap: 'intake',
+    test: (t) => (has(t, 'create', 'draft', 'start', 'new') && has(t, 'nda', 'agreement', 'mutual'))
+      && !has(t, 'response', 'redline', 'review the', 'use defaults'),
+    reply: (t) => {
+      // Parse the counterparty from a single natural-language prompt, e.g.
+      // "create an NDA using the ChargePoint template for UnifyApps".
+      const m = t.match(/(?:for|with)\s+(.+)$/i)
+      const query = (m?.[1] ?? '')
+        .replace(/\b(using|from|on the|on)\b.*$/i, '')
+        .replace(/\b(the\s+)?chargepoint\b/gi, '').replace(/\btemplate\b/gi, '')
+        .replace(/['".]+$/, '').trim()
+      const behalf = t.match(/on behalf of\s+([a-z][a-z .'-]{1,30})/i)?.[1]?.trim()
+      if (!query) {
+        return {
+          text: `Happy to draft an NDA. **Who's the counterparty?** Give me a name or website — e.g. *"create an NDA using the ChargePoint template for UnifyApps"* — and I'll resolve the entity, address, jurisdiction and likely posture from CRM and the web, then pre-fill the brief. You only confirm and add the signer.`,
+          artifact: { kind: 'none' },
+          actions: [
+            { label: 'NDA for UnifyApps', prompt: 'create an NDA using the ChargePoint template for UnifyApps', variant: 'primary' },
+            { label: 'NDA for Google', prompt: 'create an NDA for Google' },
+          ],
+        }
+      }
+      const profile = lookupCounterparty(query)[0]
+      const ctx = profile ? inferDealContext(profile) : null
+      const cp = profile?.legal_name ?? query
+      const wantsMsa = has(t, 'and an msa', 'and a msa', 'and msa', 'msa too', 'plus an msa', 'master services', 'and a master')
+      const known = !!profile && !profile.address.toLowerCase().includes('pending')
+      const lines = profile ? [
+        `- **Counterparty:** ${profile.legal_name} · ${profile.website} · ${profile.hq_city}, ${profile.hq_country}${known ? '' : '  _(unverified — confirm in the brief)_'}`,
+        `- **Template:** ChargePoint Mutual NDA 2025 · **law:** ${ctx?.governingLaw}${profile.hq_country !== 'USA' && profile.hq_country !== '—' ? ' _(foreign-counterparty note applied)_' : ''}`,
+        `- **Posture:** ${ctx?.clausePosture}`,
+        profile.sf_opportunity ? `- **Salesforce:** ${profile.sf_opportunity} (auto-linked)` : `- **Salesforce:** no opportunity linked (optional)`,
+      ].join('\n') : ''
+      return {
+        text: `On it. Drafting a **Mutual NDA** on the **ChargePoint template** for **${cp}**${behalf ? `, filed on behalf of **${behalf}**` : ''}${wantsMsa ? ' — **plus an MSA** to review in parallel' : ''}.\n\nHere's what I inferred — all editable:\n${lines}\n\nRequestor is auto-filled from your login. **Open the drafting brief** to confirm the counterparty and add the signer — everything else is done.`,
+        artifact: { kind: 'intake_form', refId: cp, title: `Open the drafting brief — ${cp}` },
+        effect: () => { const st = useStore.getState(); st.prepareIntake({ query, rawPrompt: t, onBehalfOf: behalf }); if (wantsMsa) st.addIntakeAgreementType('MSA') },
+        actions: [
+          { label: 'Use defaults & generate', prompt: `use defaults and generate the NDA for ${cp}`, variant: 'primary' },
+          { label: 'Different counterparty', prompt: 'create a new NDA' },
+        ],
+      }
+    },
+  },
+  {
+    name: 'create_confirm', cap: 'intake',
+    test: (t) => has(t, 'use defaults') && has(t, 'generate', 'nda'),
+    reply: (t) => ({
+      text: `Done. ✅ Generated **V1** from the ChargePoint Mutual NDA 2025 template, populated the parties and registered address, ran a key-field QA pass, and created the ticket — routed to the matched attorney. Opening it now; review whenever you're ready.`,
+      artifact: { kind: 'ticket_created', title: 'NDA created' },
+      effect: () => {
+        const st = useStore.getState()
+        let p = st.canvas.intakePayload
+        if (!p || !p.profile) {
+          const m = t.match(/for\s+(.+)$/i)
+          const query = (m?.[1] ?? '').replace(/\b(using|from|on)\b.*$/i, '').replace(/\btemplate\b/gi, '').trim()
+          if (query) { st.prepareIntake({ query, rawPrompt: t }); p = useStore.getState().canvas.intakePayload }
+        }
+        if (p?.profile) {
+          st.confirmCounterparty(p.profile)
+          const ticket = st.generateNdaFromIntake()
+          if (ticket) setTimeout(() => useStore.getState().openTicket(ticket.id), 60)
+        } else {
+          st.setToast('Tell me the counterparty first — e.g. "create an NDA for UnifyApps".')
+        }
+      },
+      actions: [
+        { label: 'Show the dashboard', prompt: 'show me the dashboard', variant: 'primary' },
+        { label: 'Create another', prompt: 'create a new NDA' },
+      ],
+    }),
+  },
+  {
+    name: 'contracts_list', cap: 'pipeline',
+    test: (t) => has(t, 'all contract', 'all the contract', 'list of contract', 'list of agreement', 'contracts list', 'every contract', 'all records', 'all deals', 'all my contract', 'show me all contract'),
+    reply: () => ({
+      text: `Here's the **full contracts list** — every agreement with its stage, whose court it's in and how long it's been waiting, the ChargePoint owner, and the agreement date. Open it below; you can search and filter by stage, turn, or counterparty.`,
+      artifact: { kind: 'contracts', title: 'All contracts' },
+      actions: [{ label: 'Show the dashboard', prompt: 'show me the dashboard' }],
+    }),
+  },
+  {
+    name: 'playbook', cap: 'playbook_view',
+    test: (t) => has(t, 'playbook') && !has(t, 'flag', 'no playbook', 'future playbook', 'guidance'),
+    reply: (t) => {
+      if (has(t, 'msa', 'master services', 'indemnif', 'nesting', 'nested')) {
+        return {
+          text: `The **ChargePoint MSA 2025** playbook — a complex contract, so it uses **nested provisions**: e.g. **Indemnification** is a parent with children (Scope, Exclusions, Limitations, Notification, Control of Defense), and **Limitation of Liability** is a mutual-cap red line. Open it below; expand a parent to see its sub-provisions.`,
+          artifact: { kind: 'playbook', refId: 'pb_msa', title: 'MSA Playbook (nested)' },
+          effect: () => useStore.getState().setPlaybook('pb_msa'),
+          actions: [{ label: 'Review playbook suggestions', prompt: 'review playbook suggestions' }],
+        }
+      }
+      if (has(t, 'add', 'residual', 'new provision', 'fallback', 'edit')) {
+        return {
+          text: `I can extend the **NDA playbook** in natural language. You mentioned **residuals** — right now it lives only as a strict *red line* under §4 Exclusions. I can add it as a **named provision** with its own positions so the system flags it consistently.\n\nProposed entry:\n- **Standard position:** No residuals clause.\n- **Fallback 1:** *(none — not negotiable)*\n- **Red line:** Any clause permitting use of information retained in memory.\n- **Rationale:** Erodes trade-secret protection; rejected in 100% of sampled deals.\n\nPlaybook changes require **Playbook Owner** approval (Eric Batill). Want me to draft this as a change request for his sign-off?`,
+          artifact: { kind: 'playbook', title: 'NDA playbook — add provision' },
+          actions: [
+            { label: 'Draft change request for Eric', prompt: 'draft the playbook change request', variant: 'primary' },
+            { label: 'Open the playbook', prompt: 'show me the NDA playbook' },
+          ],
+        }
+      }
+      return {
+        text: `The **ChargePoint Mutual NDA 2025 (North America)** playbook — v3, owned by Eric Batill, generated from 11 executed NDAs plus Clever Devices and Mondelez.\n\nIt has **8 provisions** with baseline positions, approved fallback tiers, and strict red lines. The most-negotiated are **Term & Termination (41% of deals)** and **Governing Law (33%)**. Open it below — each provision shows its negotiation rate and rationale.`,
+        artifact: { kind: 'playbook', title: 'NDA Negotiation Playbook' },
+        actions: [
+          { label: 'Most-negotiated provisions', prompt: 'which provisions are most negotiated?' },
+          { label: 'Add a residuals provision', prompt: 'add a residuals provision to the playbook' },
+        ],
+      }
+    },
+  },
+  {
+    name: 'deal_summary', cap: 'deal_summary',
+    test: (t) => has(t, 'summary', 'summarize', 'lessons', 'mondelez') && !has(t, 'change'),
+    reply: () => ({
+      text: `Here's the **deal summary** for the executed **Mondelez Mutual NDA** (closed 2026-05-19, signed via DocuSign):\n\n- **Counterparty:** Mondelez International · **Type:** Mutual NDA · **Paper:** CP\n- **Key terms:** 2-yr term, 5-yr CI survival, Delaware law.\n- **Concessions:** accepted marking grace period (Fallback 1); legal-hold copy retention.\n- **Improvements vs. their first draft:** removed unilateral indemnity; restored mutual injunctive relief.\n- **Lessons learned:** counterparty consistently pushes marking requirements → already an approved fallback, so cycle time was fast (17 days).\n\nStored permanently and feeding the weekly playbook-refinement loop.`,
+      artifact: { kind: 'deal_summary', refId: 'AGR-2150', title: 'Mondelez NDA — Deal summary' },
+      actions: [{ label: 'See refinement insights', prompt: 'what is the refinement loop recommending?' }],
+    }),
+  },
+  {
+    name: 'refinement', cap: 'playbook_view',
+    test: (t) => has(t, 'refinement', 'refine', 'most negotiated', 'analytics', 'acceptance rate', 'concession'),
+    reply: () => ({
+      text: `From the **weekly refinement analysis** across executed NDAs:\n\n- **Marking / Identification** — negotiated in 27%; both fallbacks now widely accepted → **recommend: keep, monitor.**\n- **Term & Termination** — negotiated in 41%, almost always landing at 3yr/3yr → **recommend: add 3yr/3yr as an approved Fallback 1** (already drafted).\n- **Residuals** — counterparties introduced it in 3 recent deals, rejected each time → **recommend: promote to a named red-line provision** for consistent flagging.\n- **Governing Law** — 33% negotiated; neutral-NY fallback trending up.\n\nAll recommendations route to **Eric Batill** for approval before changing the playbook.`,
+      artifact: { kind: 'playbook', title: 'Refinement recommendations' },
+      actions: [{ label: 'Open the playbook', prompt: 'show me the NDA playbook', variant: 'primary' }],
+    }),
+  },
+  {
+    name: 'no_playbook_guidance', cap: 'review',
+    test: (t) => (has(t, 'guidance') && has(t, 'no playbook', 'manual')) || has(t, 'suggest creating a playbook', 'suggest a playbook'),
+    reply: () => ({
+      text: `For agreements without a playbook (the Northwind **MSA / DPA / SOW**), I don't auto-classify — these stay attorney-led. I can still:\n\n- **Guide clause-by-clause**, grounded in our prior MSA/DPA deals and market standard.\n- **Flag unusual terms** — liability caps, IP assignment, data-processing roles — for your attention.\n- **Draft fallback language** on request.\n\nOnce a deal in a new category executes, I can **propose a playbook from it** (the baseline you accepted + the fallbacks you landed on) for the Playbook Owner to approve.`,
+      artifact: { kind: 'none' },
+      actions: [
+        { label: 'Flag MSA for a future playbook', prompt: 'flag the northwind MSA for a future playbook', variant: 'primary' },
+        { label: 'Open the NDA playbook', prompt: 'show me the NDA playbook' },
+      ],
+    }),
+  },
+  {
+    name: 'flag_playbook', cap: 'review',
+    test: (t) => has(t, 'flag') && has(t, 'playbook'),
+    reply: () => ({
+      text: `Flagged. I'll watch the **Northwind MSA** through execution and, once signed, draft a candidate MSA playbook from the final terms for the Playbook Owner (Eric Batill) to review. You'll get a notification when it's ready.`,
+      artifact: { kind: 'none' },
+      effect: () => useStore.getState().setToast('Northwind MSA flagged for playbook creation after execution.'),
+      actions: [{ label: "What's on my plate?", prompt: "what's on my plate?", variant: 'primary' }],
+    }),
+  },
+  {
+    name: 'admin', cap: 'admin',
+    test: (t) => has(t, 'admin', 'configure', 'routing', 'integration', 'sla config', 'manage user'),
+    reply: () => ({
+      text: `The **Admin Console** is ready — open it below. From here you configure assignment **routing**, **SLA** targets, **approval** chains, **notification** channels, **users & RBAC**, and **integrations** (Entra, DocuSign, SharePoint, Salesforce, LLMs). Changes are audited.`,
+      artifact: { kind: 'admin', title: 'Admin console' },
+      actions: [{ label: 'Review the audit log', prompt: 'show me the audit log', variant: 'primary' }],
+    }),
+  },
+  {
+    name: 'audit', cap: 'audit',
+    test: (t) => has(t, 'audit', 'event history', 'event log', 'who changed', 'tamper'),
+    reply: () => ({
+      text: `The **Audit Center** — every action is an immutable, hash-chained event (7-year retention, regional residency). Open it below to filter by event type and see whether the actor was a person or the CLM agent.`,
+      artifact: { kind: 'audit', title: 'Audit center' },
+    }),
+  },
+  {
+    name: 'dashboard', cap: 'pipeline',
+    test: (t) => has(t, 'dashboard', 'overview', 'pipeline', 'status', 'where are we', "what's going on", 'home'),
+    reply: () => {
+      const s = useStore.getState()
+      const active = s.tickets.filter((t) => t.status !== 'Executed' && t.status !== 'Resolved').length
+      return {
+        text: `Here's the legal pipeline. **${active} active matters**, ${s.tickets.filter((t) => t.status === 'Executed').length} recently executed. One SLA alert: **Airbus (TKT-1039)** at 80%. Vishay's redline is analyzed and waiting on your dispositions. Open the dashboard below.`,
+        artifact: { kind: 'dashboard', title: 'Legal CLM dashboard' },
+        actions: [
+          { label: 'Review Vishay redline', prompt: 'review the Vishay redline', variant: 'primary' },
+          { label: "What's on my plate?", prompt: "what's on my plate?" },
+        ],
+      }
+    },
+  },
+  {
+    name: 'repository', cap: 'review',
+    test: (t) => has(t, 'all agreements', 'all the agreements', 'all versions', 'repository', 'document library', 'all my agreements', 'every agreement', 'agreement folder', 'version history of all'),
+    reply: () => ({
+      text: `The **Archive** holds executed and final agreements by counterparty (restricted to senior attorneys and leadership), with the full version history under each. Open it below to browse — day-to-day work happens on the Dashboard and deal pages.`,
+      artifact: { kind: 'repository', title: 'Archive' },
+      actions: [],
+    }),
+  },
+  {
+    name: 'open_ticket', cap: 'review',
+    test: (t) => /tkt-?\d{3,}/i.test(t) || has(t, 'open ticket', 'open airbus', 'open vishay', 'open northwind'),
+    reply: (t) => {
+      const m = t.match(/tkt-?(\d{3,})/i)
+      let id = m ? `TKT-${m[1]}` : ''
+      if (!id) {
+        if (has(t, 'airbus')) id = 'TKT-1039'
+        else if (has(t, 'vishay')) id = 'TKT-1042'
+        else if (has(t, 'northwind')) id = 'TKT-1031'
+      }
+      const st = useStore.getState()
+      const t2 = st.tickets.find((x) => x.id === id)
+      if (!t2) return { text: `I couldn't find that ticket. Want the dashboard?`, actions: [{ label: 'Dashboard', prompt: 'show me the dashboard' }] }
+      const me = st.users.find((u) => u.id === st.currentUserId)!
+      if (!canSeeTicket(st.tickets, st.messages, me, id)) {
+        return { text: `🔒 **${id}** isn't in your scope. As ${ROLE_LABEL[me.role]}, you can only access matters you ${me.role === 'initiator' ? 'created' : me.role === 'contributor' ? 'are tagged on' : 'are assigned to'}.`, artifact: { kind: 'none' }, actions: [{ label: "What's on my plate?", prompt: "what's on my plate?", variant: 'primary' }] }
+      }
+      return {
+        text: `**${t2.title}** (${id}) — a ${t2.type.replace('_', ' ')} at **${t2.status}**, assigned to ${userById(t2.assigned_attorney_id || '')?.name}. Open the workspace below — Deal Discussion and Agreement Review.`,
+        artifact: { kind: 'ticket', refId: id, title: t2.title },
+        actions: [{ label: 'Review the agreement', prompt: `review the ${t2.counterparty_name} redline`, variant: 'primary' }],
+      }
+    },
+  },
+  {
+    name: 'open_doc', cap: 'review',
+    test: (t) => has(t, 'open the', 'document', 'show the doc', 'word', 'view the document'),
+    reply: () => ({
+      text: `The **document view** for the Vishay NDA is ready. Tracked changes show insertions and deletions with party attribution — counterparty edits are in blue, ours in green. Open it below; click any clause with an issue badge to jump to its analysis.`,
+      artifact: { kind: 'document', refId: 'AGR-2201', title: 'Vishay NDA — document view' },
+      actions: [{ label: 'Back to issues', prompt: 'review the Vishay redline' }],
+    }),
+  },
+  {
+    name: 'help',
+    test: (t) => has(t, 'help', 'what can you', 'capabilities', 'who are you', 'hi', 'hello', 'hey'),
+    reply: () => ({
+      text: `I'm the **CLM Agent** — I run ChargePoint's contract lifecycle end to end, and you stay the decision-maker. I can:\n\n- **Intake & draft** — "create a new NDA for Vishay"\n- **Analyze redlines** against the playbook — "review the Vishay redline"\n- **Walk dispositions** — accept / negotiate / red-line each deviation, or apply all recommended\n- **Draft your response** — clean + redline, internal comments stripped\n- **Manage the playbook** in natural language — "add a residuals provision"\n- **Answer status questions** — "what's on my plate?", "summarize the Mondelez deal"\n\nI never approve terms, send externally, or sign — those are yours. What would you like to do?`,
+      artifact: { kind: 'dashboard', title: 'CLM dashboard' },
+      actions: [
+        { label: 'Review the Vishay redline', prompt: 'review the Vishay redline', variant: 'primary' },
+        { label: 'Create a new NDA', prompt: 'create a new NDA' },
+        { label: "What's on my plate?", prompt: "what's on my plate?" },
+      ],
+    }),
+  },
+]
+
+// Summary line for the wizard's confirm step.
+function wizardSummary(): string {
+  const s = useStore.getState()
+  const w = s.negotiationWizard
+  if (!w) return ''
+  const scopeLabel = w.scope === 'multiple' ? 'Multiple agreements' : 'Single agreement'
+  const sourceLabel = w.sourceMode === 'template'
+    ? (s.templates.filter((tpl) => (w.templateIds ?? []).includes(tpl.id)).map((tpl) => tpl.name).join(', ') || 'no template selected')
+    : (w.uploadedFiles ?? []).join(', ') || 'no file uploaded'
+  return `Here's what I'll create:\n\n- **Scope:** ${scopeLabel}\n- **Source:** ${sourceLabel}\n- **Counterparty:** ${w.counterparty}\n\nShall I proceed?`
+}
+
+function route(text: string): { reply: AgentReply; matched: boolean } {
+  const t = text.toLowerCase().trim()
+  const role = currentRole()
+  // Step 3 of the wizard — ANY free text at this point is the counterparty name, not a normal
+  // intent (so a counterparty called e.g. "Airbus" doesn't accidentally match another rule).
+  const wiz = useStore.getState().negotiationWizard
+  if (wiz?.step === 'counterparty' && text.trim()) {
+    useStore.getState().setWizardCounterparty(text.trim())
+    return {
+      matched: true,
+      reply: {
+        text: wizardSummary(),
+        artifact: { kind: 'none' },
+        actions: [
+          { label: 'Yes, create it', prompt: 'confirm ticket wizard', variant: 'primary' },
+          { label: 'Start over', prompt: 'restart ticket wizard' },
+        ],
+      },
+    }
+  }
+  for (const i of intents) {
+    if (!i.test(t)) continue
+    if (i.cap && !can(role, i.cap)) return { reply: denial(role, i.cap), matched: true }
+    return { reply: i.reply(t), matched: true }
+  }
+  return {
+    matched: false,
+    reply: {
+      text: `I can help with that within the contract workflow. Try one of these, or ask about a specific deal (Vishay, Airbus, Northwind, Mondelez).`,
+      actions: [
+        { label: 'Review the Vishay redline', prompt: 'review the Vishay redline', variant: 'primary' },
+        { label: 'Show the dashboard', prompt: 'show me the dashboard' },
+        { label: 'Create a new NDA', prompt: 'create a new NDA' },
+      ],
+    },
+  }
+}
+
+// Build grounding context for the live model from current store state.
+function buildContext(): string {
+  const s = useStore.getState()
+  const pb = s.playbooks[0]
+  const devs = s.deviations.filter((d) => d.agreement_id === 'AGR-2201')
+  const lines: string[] = []
+  lines.push(`Active deal: Vishay Intertechnology Mutual NDA (CP paper, redline received). Counterparty returned Draft 2.`)
+  lines.push(`Playbook "${pb.name}" provisions: ${pb.provisions.map((p) => `${p.provision_name} (negotiated ${p.negotiated_pct ?? 0}%, ${p.fallback_tiers.length} fallback(s); red line: ${p.red_line})`).join('; ')}.`)
+  lines.push(`Vishay deviations: ${devs.map((d) => `${d.provision_name} ${d.section_reference} [${d.risk_category}] — template: ${d.template_position} | counterparty: ${d.counterparty_position} | recommended: ${d.recommended_response} (disposition: ${d.disposition_status})`).join(' || ')}.`)
+  lines.push(`Other deals: Airbus NDA (in negotiation, SLA risk), Northwind CaaS (MSA/DPA/SOW, no playbook), Mondelez & Clever Devices (executed).`)
+  // R44 — carry the executed-precedent corpus so the assistant reasons over real prior deals (never fabricated).
+  lines.push(`Executed precedent corpus:\n${precedentDigest()}`)
+  return lines.join('\n')
+}
+
+// Attempt a live model call via the serverless endpoint. Returns null if unavailable (→ fallback).
+async function callLiveModel(text: string): Promise<string | null> {
+  try {
+    const r = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ message: text, context: buildContext() }),
+    })
+    if (!r.ok) return null
+    const j = await r.json()
+    if (j?.error || !j?.text) return null
+    return j.text as string
+  } catch {
+    return null
+  }
+}
+
+// ---- public API -------------------------------------------------------------
+export function openArtifact(a: { kind: ArtifactKind; refId?: string; title?: string }) {
+  const s = useStore.getState()
+  switch (a.kind) {
+    case 'redline_review':
+    case 'agreement': s.openAgreement(a.refId ?? 'AGR-2201', 'review'); break
+    case 'document':
+      s.openAgreement(a.refId ?? 'AGR-2201', 'review')
+      s.navigate({ reviewMode: 'document' })
+      break
+    case 'ticket': s.openTicket(a.refId ?? 'TKT-1042'); break
+    case 'playbook': s.setView('playbook'); s.navigate({ playbookMode: 'inventory' }); break
+    case 'playbook_create': s.openCanvas({ view: 'playbook', playbookMode: 'create' }); break
+    case 'playbook_suggestions': s.openCanvas({ view: 'playbook', playbookMode: 'suggestions' }); break
+    case 'redline_doc': s.openSendBack(a.refId ?? 'AGR-2201'); s.navigate({ reviewMode: 'redline' }); break
+    case 'send_back': s.openSendBack(a.refId ?? 'AGR-2201'); break
+    case 'deal_execution': s.openDealExecution(a.refId ?? 'TKT-1031'); break
+    case 'projects': s.openProjects(a.refId || undefined); break
+    case 'template': { const tpl = s.templates.find((x) => x.id === a.refId); s.openProjects(tpl?.project_id || undefined); if (a.refId) s.navigate({ templateId: a.refId }); break }
+    case 'dashboard': s.setView('dashboard'); break
+    case 'deal_summary': s.openCanvas({ view: 'deal_summary', dealSummaryId: a.refId ?? 'AGR-2150' }); break
+    case 'tagged_items': s.openCanvas({ view: 'queue' }); break
+    case 'intake_form': s.openCanvas({ view: 'intake', intakeCp: a.refId || undefined }); break
+    case 'execution': s.openCanvas({ view: 'execution', executionAgreementId: a.refId ?? 'AGR-2201', executionTicketId: undefined }); break
+    case 'admin': s.setView('admin'); break
+    case 'audit': s.setView('audit'); break
+    case 'repository': s.setView('repository'); break
+    case 'contracts': s.openContracts('all'); break
+    case 'ticket_created': s.setView('dashboard'); break
+    default: break
+  }
+}
+
+const pushAgent = (reply: AgentReply) => {
+  // Mutations (dispositions, approvals, ticket creation, …) run immediately.
+  reply.effect?.()
+  useStore.getState().pushChat({
+    id: cid(), role: 'agent', text: reply.text, ts: ts(),
+    artifact: reply.artifact, actions: reply.actions, aiGenerated: true, widget: reply.widget,
+  })
+  // Navigation is click-to-open: from the hero we never auto-open the right pane —
+  // the user clicks the artifact chip. If a workspace is already docked, we keep it in sync.
+  if (useStore.getState().canvas.open && reply.artifact && reply.artifact.kind !== 'none') {
+    openArtifact(reply.artifact)
+  }
+  useStore.getState().setAgentThinking(false)
+}
+
+// Called directly by the embedded ticket_source widget (template multi-select / upload) —
+// it manipulates the wizard + chat timeline itself rather than going through text routing,
+// since a structured multi-select doesn't map onto a single free-text prompt.
+export function submitTicketSource(payload: { sourceMode: 'template' | 'upload'; templateIds?: string[]; uploadedFiles?: string[] }) {
+  const store = useStore.getState()
+  store.setWizardSource(payload)
+  const summary = payload.sourceMode === 'template'
+    ? `Use template${(payload.templateIds ?? []).length > 1 ? 's' : ''}: ${store.templates.filter((tpl) => (payload.templateIds ?? []).includes(tpl.id)).map((tpl) => tpl.name).join(', ')}`
+    : `Upload my own document${(payload.uploadedFiles ?? []).length > 1 ? 's' : ''}: ${(payload.uploadedFiles ?? []).join(', ')}`
+  store.pushChat({ id: cid(), role: 'user', text: summary, ts: ts() })
+  store.setAgentThinking(true)
+  setTimeout(() => pushAgent({
+    text: `Got it. **Who's the counterparty?**`,
+    artifact: { kind: 'none' },
+  }), 260)
+}
+
+export function sendToAgent(text: string) {
+  const store = useStore.getState()
+  store.pushChat({ id: cid(), role: 'user', text, ts: ts() })
+  store.setAgentThinking(true)
+
+  const { reply, matched } = route(text)
+
+  if (matched) {
+    // Brief, snappy "thinking" beat (R12 — was 600–1200ms; the agent should feel fast at scale).
+    const delay = 220 + Math.min(text.length * 3, 260)
+    setTimeout(() => pushAgent(reply), delay)
+    return
+  }
+
+  // R112 — thin layer over Claude: off-script questions go to the live model FIRST; the deterministic
+  // reasoner (answerFromState, grounded in real store data) is the always-on floor — not a canned string.
+  callLiveModel(text).then((live) => {
+    if (live) {
+      pushAgent({ text: live, actions: reply.actions })
+    } else {
+      pushAgent({ text: answerFromState(text), artifact: { kind: 'none' }, actions: reply.actions })
+    }
+  })
+}
+
