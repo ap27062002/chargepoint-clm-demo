@@ -1,10 +1,10 @@
 import { clsx } from 'clsx'
-import { Sparkles, LayoutDashboard, BookOpen, FolderTree, Lock, FileStack, UserCog } from 'lucide-react'
+import { Sparkles, LayoutDashboard, BookOpen, FolderTree, Lock, FileStack, UserCog, BarChart3 } from 'lucide-react'
 import { useStore } from '@/store'
 import { can } from '@/lib/access'
 import type { Role } from '@/types'
 
-type RailKey = 'agent' | 'dashboard' | 'repository' | 'playbook' | 'projects' | 'console'
+type RailKey = 'agent' | 'dashboard' | 'repository' | 'playbook' | 'projects' | 'console' | 'reports'
 type RailItem = {
   key: RailKey
   label: string
@@ -22,6 +22,8 @@ const ITEMS: RailItem[] = [
   { key: 'playbook', label: 'Playbook', icon: <BookOpen size={18} />, show: (r) => can(r, 'playbook_view') },
   { key: 'projects', label: 'Templates', icon: <FileStack size={18} />, show: (r) => can(r, 'templates') },
   { key: 'console', label: 'Console', icon: <UserCog size={18} />, show: (r) => can(r, 'admin') },
+  // Reports & Analytics — every role gets this (legal leadership, business stakeholders, auditors).
+  { key: 'reports', label: 'Reports', icon: <BarChart3 size={18} />, show: (r) => can(r, 'reports') },
 ]
 
 export function LeftRail() {
@@ -35,8 +37,10 @@ export function LeftRail() {
   // they work entirely through the agent chat + their dashboard, not the full workspace nav.
   // Dana (administrator) is the one exception: she also gets Console, her one real UI surface.
   const RESTRICTED: Role[] = ['contributor', 'administrator', 'initiator']
+  // Reports & Analytics is explicitly for everyone, including light-touch roles — legal
+  // leadership, business stakeholders (sales/finance), and auditors all need it.
   const visible = ITEMS.filter((i) => (RESTRICTED.includes(role)
-    ? i.key === 'agent' || i.key === 'dashboard' || (i.key === 'console' && role === 'administrator')
+    ? i.key === 'agent' || i.key === 'dashboard' || i.key === 'reports' || (i.key === 'console' && role === 'administrator')
     : !i.show || i.show(role)))
 
   const go = (k: RailKey) => {
